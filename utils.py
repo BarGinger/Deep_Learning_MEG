@@ -35,12 +35,15 @@ import random
 import optuna
 import json
 from Model import MEGClassifier
+from sklearn.model_selection import StratifiedShuffleSplit
+
 
 # Gloval variables
 debug_mode = False
+TASKS = ["resting", "math", "memory", "motor"]
+METRICS = ["accuracy", "F1", "recall", "precision"]
 
 # functions
-
 def get_dataset_from_h5py(filename_path):
     """
         Get the dataset from the h5py file.
@@ -106,8 +109,6 @@ def load_eeg_data_and_metadata(folder_path, split):
     return torch.stack(data), df
 
 
-
-
 ### normalizion and scaling and downsampling
 def downsample(data, factor):
     """
@@ -162,7 +163,7 @@ def save_tensor_and_df(tensor, df, prefix, scaler_type):
 def load_tensor_and_df(prefix, scaler_type):
     scaler_str = scaler_type.name.lower()
     out_folder = os.path.join("Data", "Normalized", scaler_str)
-    tensor = torch.load(os.path.join(out_folder, f"{prefix}_scaled.pt"))
+    tensor = torch.load(os.path.join(out_folder, f"{prefix}_scaled.pt"), weights_only=False)
     df = pd.read_csv(os.path.join(out_folder, f"{prefix}_meta.csv"))
     return tensor, df
 
@@ -196,7 +197,7 @@ def try_load_scaled(prefix, scaler_type):
     df_path = os.path.join(out_folder, f"{prefix}_meta.csv")
     if os.path.exists(tensor_path) and os.path.exists(df_path):
         print(f"Loading cached: {tensor_path}")
-        return torch.load(tensor_path), pd.read_csv(df_path)
+        return torch.load(tensor_path, weights_only=False), pd.read_csv(df_path)
     return None, None
 
 def extract_sliding_windows(data_tensor, window_size=256, stride=128):
@@ -221,23 +222,60 @@ def extract_sliding_windows(data_tensor, window_size=256, stride=128):
     sample_indices = torch.arange(N).repeat_interleave(num_windows)
     return windows, sample_indices
 
-def get_dataloaders(data_tensor, df, batch_size=64, val_split=0.2, input_time_length=256, stride=128, shuffle=True):
+
+def get_dataloaders(
+    data_tensor, df, batch_size=64, val_split=0.2, input_time_length=256, stride=128, shuffle=True
+):
+    """
+    Create stratified train and validation DataLoaders from EEG/MEG data, ensuring all task types are present in both splits.
+
+    Parameters
+    ----------
+    data_tensor : torch.Tensor
+        EEG data of shape (N, C, T), where N is number of samples, C is channels, T is time.
+    df : pd.DataFrame
+        Metadata DataFrame with a 'task_type' column.
+    batch_size : int, optional
+        Batch size for DataLoaders (default: 64).
+    val_split : float, optional
+        Fraction of data to use for validation (default: 0.2).
+    input_time_length : int, optional
+        Length of each sliding window (default: 256).
+    stride : int, optional
+        Stride for sliding window extraction (default: 128).
+    shuffle : bool, optional
+        Whether to shuffle windows before splitting (default: True).
+
+    Returns
+    -------
+    train_loader : DataLoader
+        DataLoader for the training set.
+    val_loader : DataLoader
+        DataLoader for the validation set.
+    train_X : torch.Tensor
+        Training windows.
+    train_y : torch.Tensor
+        Training labels.
+    val_X : torch.Tensor
+        Validation windows.
+    val_y : torch.Tensor
+        Validation labels.
+    """
     X, sample_indices = extract_sliding_windows(data_tensor, window_size=input_time_length, stride=stride)
     X = X.float()
     y_full = df['task_type'].astype('category').cat.codes.values
     y = torch.tensor(y_full[sample_indices], dtype=torch.long)
     n = len(X)
-    idx = np.arange(n)
-    if shuffle:
-        np.random.shuffle(idx)
-    split = int(n * (1 - val_split))
-    train_idx, val_idx = idx[:split], idx[split:]
+
+    # Stratified split to ensure all tasks are in both sets
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=val_split, random_state=42)
+    train_idx, val_idx = next(sss.split(np.zeros(n), y.numpy()))
+
     train_X, val_X = X[train_idx], X[val_idx]
     train_y, val_y = y[train_idx], y[val_idx]
     train_loader = DataLoader(TensorDataset(train_X, train_y), batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(TensorDataset(val_X, val_y), batch_size=batch_size, shuffle=False)
     return train_loader, val_loader, train_X, train_y, val_X, val_y
-
 
 ## tainging and logging related functions
 def create_metrics_df():
@@ -249,17 +287,24 @@ def create_metrics_df():
     metrics = ["accuracy", "F1", "recall", "precision"]
     tasks = ["overall", "resting", "math", "memory", "motor"]
     hyperparameters = [
-        "num_temporal_filters", # Reflects the number of filters in the first temporal convolution layer - X
-        "depth_multiplier", # Depth multiplier for depthwise conv (controls number of spatial filters) - Z
-        "num_pointwise_filters", # Number of pointwise filters in separable conv (F2 = D * F1 by default) - Z
-        "temporal_kernel_size", # Length of the temporal filters (1st conv)	 - X
-        "dropout_rate", # Dropout rate for the dropout layer - X
-        "activation", # Activation function used in the model - X
-        "norm_type", # Normalization type used in the model - X
-        "pool_size", # Pooling size for the pooling layer   - X
-        "input_time_length", # How long each input EEG window is - X
-        "learning_rate", # - X
-        "batch_size" # - X
+        "input_channels",
+        "num_temporal_filters",
+        "temporal_kernel_size",
+        "dropout_rate",
+        "activation",
+        "pool_size",
+        "num_classes",
+        "conv2d_channels",
+        "transformer_d_model",
+        "transformer_nhead",
+        "transformer_dim_feedforward",
+        "transformer_layers",
+        "fc_hidden",
+        "fc_dropout",
+        "learning_rate",
+        "batch_size",
+        "input_time_length",  # for windowing
+        "stride"              # for windowing
     ]
 
     # Generate columns for train, val, and test metrics
@@ -281,16 +326,6 @@ def create_metrics_df():
         print(all_metrics_df.columns)
 
     return all_metrics_df
-
-
-import torch
-from sklearn.metrics import accuracy_score, f1_score, recall_score, precision_score
-import pandas as pd
-from tqdm.auto import tqdm
-import numpy as np
-
-TASKS = ["overall", "resting", "math", "memory", "motor"]
-METRICS = ["accuracy", "F1", "recall", "precision"]
 
 def compute_metrics(y_true, y_pred, task_labels=None, task_names=None):
     """Compute metrics for overall and per-task."""
@@ -365,11 +400,9 @@ def train_model(
         val_metrics = compute_metrics(val_targets, val_preds, val_targets, task_names)
         # Fill DataFrame row for all columns
         for split, metrics_dict in zip(["train", "val"], [train_metrics, val_metrics]):
-            for task in task_names:
-                for metric in METRICS:
-                    col = f"{split}_{task}_{metric}"
-                    key = f"{task}_{metric}"
-                    row[col] = metrics_dict.get(key, np.nan)
+            for key, value in metrics_dict.items():
+                col = f"{split}_{key}"
+                row[col] = value
         # (test columns left empty here)
         for task in task_names:
             for metric in METRICS:
@@ -404,10 +437,10 @@ def objective(trial, all_metrics_df, train_data, train_df, device):
         "num_temporal_filters": trial.suggest_categorical('num_temporal_filters', [8, 16, 32]),
         "temporal_kernel_size": trial.suggest_categorical('temporal_kernel_size', [32, 64, 128]),
         "dropout_rate": trial.suggest_float('dropout_rate', 0.2, 0.7, step=0.1),
-        "activation": trial.suggest_categorical('activation', ['elu', 'relu', 'gelu']),
+        "activation": trial.suggest_categorical('activation', ['relu', 'gelu']),
         "pool_size": trial.suggest_categorical('pool_size', [2, 4, 8]),
         "num_classes": len(np.unique(train_df['task_type'])),
-        "conv2d_channels": trial.suggest_categorical('conv2d_channels', [[128, 256], [64, 128], [256, 512]]),
+        "conv2d_channels": trial.suggest_categorical("conv2d_channels", [(128, 256), (64, 128), (256, 512)]),
         "transformer_d_model": trial.suggest_categorical('transformer_d_model', [128, 256, 512]),
         "transformer_nhead": trial.suggest_categorical('transformer_nhead', [4, 8, 16]),
         "transformer_dim_feedforward": trial.suggest_categorical('transformer_dim_feedforward', [256, 512, 1024]),
@@ -419,29 +452,6 @@ def objective(trial, all_metrics_df, train_data, train_df, device):
         "input_time_length": trial.suggest_categorical('input_time_length', [256, 512]),
         "stride": trial.suggest_categorical('stride', [32, 64, 128, 256])
     }
-
-    # Validate hyperparameters before model instantiation
-    # input_time_length = hyperparams["input_time_length"]
-    # pool_size = hyperparams["pool_size"]
-    # temporal_kernel_size = hyperparams["temporal_kernel_size"]
-    # conv2d_channels = hyperparams["conv2d_channels"]
-    # num_pool_layers = 2
-    # final_size = hyperparams["input_time_length"] // (hyperparams["pool_size"] ** num_pool_layers)
-    # if final_size < 1:
-    #     raise optuna.exceptions.TrialPruned()
-    
-    # cnn1d_out_len = input_time_length // pool_size
-    # if temporal_kernel_size > cnn1d_out_len:
-    #     raise optuna.exceptions.TrialPruned()
-
-    # feature_map_size = cnn1d_out_len
-    # num_2d_layers = 1 + len(conv2d_channels)
-    # for _ in range(num_2d_layers):
-    #     if temporal_kernel_size > feature_map_size:
-    #         raise optuna.exceptions.TrialPruned()
-    #     feature_map_size = feature_map_size // pool_size
-    #     if feature_map_size < 1:
-    #         raise optuna.exceptions.TrialPruned()
 
     # When instantiating the model, unpack the dictionary:
     model = MEGClassifier(**{k: v for k, v in hyperparams.items() if k in MEGClassifier.__init__.__code__.co_varnames}).to(device)
