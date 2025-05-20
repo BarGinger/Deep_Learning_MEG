@@ -34,9 +34,8 @@ import zipfile
 import random
 import optuna
 import json
-from Model import MEGClassifier
+from Model import MEGClassifier, TinyMLP
 from sklearn.model_selection import StratifiedShuffleSplit
-
 
 # Gloval variables
 debug_mode = False
@@ -261,8 +260,6 @@ def get_dataloader(
     return loader, X, y
 
 
-from sklearn.model_selection import StratifiedShuffleSplit
-
 def get_dataloaders(
         data_tensor, df, batch_size=64, val_split=0.2, input_time_length=256, stride=128
     ):
@@ -277,6 +274,11 @@ def get_dataloaders(
     # Split data and df
     train_data, val_data = data_tensor[train_idx], data_tensor[val_idx]
     train_df, val_df = df.iloc[train_idx].reset_index(drop=True), df.iloc[val_idx].reset_index(drop=True)
+
+    print("train task types counts:")
+    print(np.bincount(train_df['task_type'].astype('category').cat.codes))
+    print("val task types counts:")
+    print(np.bincount(val_df['task_type'].astype('category').cat.codes))
 
     # Extract windows for each split
     train_X, train_sample_indices = extract_sliding_windows(train_data, window_size=input_time_length, stride=stride)
@@ -341,31 +343,6 @@ def create_metrics_df():
         print(all_metrics_df.columns)
 
     return all_metrics_df
-
-def compute_metrics(y_true, y_pred, task_labels=None, task_names=None):
-    """Compute metrics for overall and per-task."""
-    results = {}
-    # Overall
-    results["overall_accuracy"] = accuracy_score(y_true, y_pred)
-    results["overall_F1"] = f1_score(y_true, y_pred, average='macro', zero_division=0)
-    results["overall_recall"] = recall_score(y_true, y_pred, average='macro', zero_division=0)
-    results["overall_precision"] = precision_score(y_true, y_pred, average='macro', zero_division=0)
-    # Per-task
-    if task_labels is not None and task_names is not None:
-        for idx, task in enumerate(task_names):
-            mask = (y_true == idx)
-            if np.sum(mask) == 0:
-                # No samples for this task in this split
-                results[f"{task}_accuracy"] = np.nan
-                results[f"{task}_F1"] = np.nan
-                results[f"{task}_recall"] = np.nan
-                results[f"{task}_precision"] = np.nan
-            else:
-                results[f"{task}_accuracy"] = accuracy_score(y_true[mask], y_pred[mask])
-                results[f"{task}_F1"] = f1_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
-                results[f"{task}_recall"] = recall_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
-                results[f"{task}_precision"] = precision_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
-    return results
 
 def train_model(
     model, train_loader, val_loader, attempt_index, epochs, lr, patience, device,
@@ -511,8 +488,8 @@ def objective(trial, all_metrics_df, train_data, train_df, device):
     }
 
     # When instantiating the model, unpack the dictionary:
-    model = MEGClassifier(**{k: v for k, v in hyperparams.items() if k in MEGClassifier.__init__.__code__.co_varnames}).to(device)
-
+    # model = MEGClassifier(**{k: v for k, v in hyperparams.items() if k in MEGClassifier.__init__.__code__.co_varnames}).to(device)
+    model = TinyMLP(**{k: v for k, v in hyperparams.items() if k in TinyMLP.__init__.__code__.co_varnames}).to(device)
 
     # DataLoaders
     train_loader, val_loader, train_X, train_y, val_X, val_y = get_dataloaders(
