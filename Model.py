@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from sklearn.metrics import accuracy_score, f1_score, recall_score, precision_score
+from sklearn.metrics import accuracy_score, f1_score, recall_score, precision_score, confusion_matrix
 
 class MEGClassifier(nn.Module):
     """
@@ -41,6 +41,7 @@ class MEGClassifier(nn.Module):
 
     def __init__(
         self,
+        tasks=["resting", "math", "memory", "motor"],
         input_channels=248,
         num_temporal_filters=8,
         temporal_kernel_size=64,
@@ -57,6 +58,13 @@ class MEGClassifier(nn.Module):
         fc_dropout=0.3
     ):
         super(MEGClassifier, self).__init__()
+
+        # format conv2d_channels if it's a string to a list
+        if isinstance(conv2d_channels, str):
+            conv2d_channels = [int(x) for x in conv2d_channels.split("_")]
+        
+        # save tasks
+        self.tasks = tasks
 
         # Activation function selection
         activations = {
@@ -160,68 +168,83 @@ class MEGClassifier(nn.Module):
         x = self.fc(x)     # (batch, num_classes)
         return x
 
-    def predict(self, x, device=None, batch_size=64):
+    def predict(self, loader, device=None):
         """
         Predict class indices for input x.
 
         Parameters
         ----------
-        x : np.ndarray or torch.Tensor
-            Input data of shape (n_samples, channels, time).
+        loader : torch.utils.data.DataLoader
+            DataLoader for the input data.
         device : torch.device or None
             Device to run prediction on.
-        batch_size : int
-            Batch size for prediction.
 
         Returns
         -------
         np.ndarray
             Predicted class indices.
         """
-        self.eval()
-        if isinstance(x, np.ndarray):
-            x = torch.tensor(x, dtype=torch.float32)
-        if device is not None:
-            x = x.to(device)
         preds = []
         with torch.no_grad():
-            for i in range(0, len(x), batch_size):
-                batch_x = x[i:i+batch_size]
+            for batch in loader:
+                # Unpack batch if it's a tuple/list (inputs, labels)
+                if isinstance(batch, (list, tuple)):
+                    batch_x = batch[0]
+                else:
+                    batch_x = batch
+                if device is not None:
+                    batch_x = batch_x.to(device)
                 outputs = self.forward(batch_x)
                 batch_preds = torch.argmax(outputs, dim=1).cpu().numpy()
                 preds.extend(batch_preds)
         return np.array(preds)
+        
 
-    def evaluate(self, x, y_true, device=None, batch_size=64, compute_metrics_fn=None):
+    def evaluate(self, y_pred, y_true):
         """
         Evaluate the model on data x with true labels y_true.
 
         Parameters
         ----------
-        x : np.ndarray or torch.Tensor
-            Input data of shape (n_samples, channels, time).
-        y_true : np.ndarray or list
+        y_pred : np.ndarray or list or torch.Tensor
+            Predicted class indices.
+        y_true : np.ndarray or list or torch.Tensor
             True class indices.
-        device : torch.device or None
-            Device to run evaluation on.
-        batch_size : int
-            Batch size for evaluation.
-        compute_metrics_fn : callable or None
-            Function to compute metrics (e.g., utils.compute_metrics). If None, uses basic sklearn metrics.
 
         Returns
         -------
         dict
             Dictionary with accuracy, F1, recall, and precision.
         """
-        y_pred = self.predict(x, device=device, batch_size=batch_size)
-        if compute_metrics_fn is not None:
-            metrics = compute_metrics_fn(y_true, y_pred)
-            return metrics
-        else:
-            return {
-                "accuracy": accuracy_score(y_true, y_pred),
-                "F1": f1_score(y_true, y_pred, average='macro', zero_division=0),
-                "recall": recall_score(y_true, y_pred, average='macro', zero_division=0),
-                "precision": precision_score(y_true, y_pred, average='macro', zero_division=0)
-            }
+        # Ensure numpy arrays for compatibility with sklearn and numpy
+        if isinstance(y_true, torch.Tensor):
+            y_true = y_true.cpu().numpy()
+
+        if isinstance(y_pred, torch.Tensor):
+            y_pred = y_pred.cpu().numpy()
+        
+        # print(confusion_matrix(y_true, y_pred))
+
+        results = {}
+        # Overall
+        results["overall_accuracy"] = accuracy_score(y_true, y_pred)
+        results["overall_F1"] = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        results["overall_recall"] = recall_score(y_true, y_pred, average='macro', zero_division=0)
+        results["overall_precision"] = precision_score(y_true, y_pred, average='macro', zero_division=0)
+
+        # Per task
+        if self.tasks is not None and len(self.tasks) > 1:
+            for idx, task in enumerate(self.tasks):
+                mask = (y_true == idx)
+                if np.sum(mask) == 0:
+                    # No samples for this task in this split
+                    results[f"{task}_accuracy"] = np.nan
+                    results[f"{task}_F1"] = np.nan
+                    results[f"{task}_recall"] = np.nan
+                    results[f"{task}_precision"] = np.nan
+                else:
+                    results[f"{task}_accuracy"] = accuracy_score(y_true[mask], y_pred[mask])
+                    results[f"{task}_F1"] = f1_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
+                    results[f"{task}_recall"] = recall_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
+                    results[f"{task}_precision"] = precision_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
+        return results

@@ -92,7 +92,7 @@ def load_eeg_data_and_metadata(folder_path, split):
         trial = m.group("trial")
         dataset = get_dataset_from_h5py(file_path)
         if dataset is not None:
-            data.append(torch.tensor(dataset))
+            data.append(torch.tensor(dataset, dtype=torch.float32))
             meta.append({
                 "filename": os.path.basename(file_path),
                 "dataset_name": task,
@@ -223,56 +223,71 @@ def extract_sliding_windows(data_tensor, window_size=256, stride=128):
     return windows, sample_indices
 
 
-def get_dataloaders(
-    data_tensor, df, batch_size=64, val_split=0.2, input_time_length=256, stride=128, shuffle=True
+def get_dataloader(
+    data_tensor, df, batch_size=64, input_time_length=256, stride=128, shuffle=False
 ):
     """
-    Create stratified train and validation DataLoaders from EEG/MEG data, ensuring all task types are present in both splits.
+    Create a DataLoader for EEG/MEG data using sliding windows.
 
     Parameters
     ----------
     data_tensor : torch.Tensor
-        EEG data of shape (N, C, T), where N is number of samples, C is channels, T is time.
+        EEG data of shape (N, C, T).
     df : pd.DataFrame
-        Metadata DataFrame with a 'task_type' column.
+        Metadata DataFrame with a 'task_type_cat' column.
     batch_size : int, optional
-        Batch size for DataLoaders (default: 64).
-    val_split : float, optional
-        Fraction of data to use for validation (default: 0.2).
+        Batch size for DataLoader (default: 64).
     input_time_length : int, optional
         Length of each sliding window (default: 256).
     stride : int, optional
         Stride for sliding window extraction (default: 128).
     shuffle : bool, optional
-        Whether to shuffle windows before splitting (default: True).
+        Whether to shuffle the dataset (default: False).
 
     Returns
     -------
-    train_loader : DataLoader
-        DataLoader for the training set.
-    val_loader : DataLoader
-        DataLoader for the validation set.
-    train_X : torch.Tensor
-        Training windows.
-    train_y : torch.Tensor
-        Training labels.
-    val_X : torch.Tensor
-        Validation windows.
-    val_y : torch.Tensor
-        Validation labels.
+    loader : DataLoader
+        DataLoader for the dataset.
+    X : torch.Tensor
+        Windows.
+    y : torch.Tensor
+        Labels.
     """
     X, sample_indices = extract_sliding_windows(data_tensor, window_size=input_time_length, stride=stride)
     X = X.float()
-    y_full = df['task_type'].astype('category').cat.codes.values
+    y_full = df['task_type_cat'].values
     y = torch.tensor(y_full[sample_indices], dtype=torch.long)
-    n = len(X)
+    loader = DataLoader(TensorDataset(X, y), batch_size=batch_size, shuffle=shuffle)
+    return loader, X, y
 
-    # Stratified split to ensure all tasks are in both sets
+
+from sklearn.model_selection import StratifiedShuffleSplit
+
+def get_dataloaders(
+        data_tensor, df, batch_size=64, val_split=0.2, input_time_length=256, stride=128
+    ):
+    """
+    Split at the sample level, then extract windows for each split.
+    """
+    # Stratified split at the sample level
+    y = df['task_type_cat'].values
     sss = StratifiedShuffleSplit(n_splits=1, test_size=val_split, random_state=42)
-    train_idx, val_idx = next(sss.split(np.zeros(n), y.numpy()))
+    train_idx, val_idx = next(sss.split(np.zeros(len(df)), y))
 
-    train_X, val_X = X[train_idx], X[val_idx]
-    train_y, val_y = y[train_idx], y[val_idx]
+    # Split data and df
+    train_data, val_data = data_tensor[train_idx], data_tensor[val_idx]
+    train_df, val_df = df.iloc[train_idx].reset_index(drop=True), df.iloc[val_idx].reset_index(drop=True)
+
+    # Extract windows for each split
+    train_X, train_sample_indices = extract_sliding_windows(train_data, window_size=input_time_length, stride=stride)
+    val_X, val_sample_indices = extract_sliding_windows(val_data, window_size=input_time_length, stride=stride)
+
+    train_y_full = train_df['task_type_cat'].values
+    val_y_full = val_df['task_type_cat'].values
+
+    train_y = torch.tensor(train_y_full[train_sample_indices], dtype=torch.long)
+    val_y = torch.tensor(val_y_full[val_sample_indices], dtype=torch.long)
+
     train_loader = DataLoader(TensorDataset(train_X, train_y), batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(TensorDataset(val_X, val_y), batch_size=batch_size, shuffle=False)
     return train_loader, val_loader, train_X, train_y, val_X, val_y
@@ -356,16 +371,25 @@ def train_model(
     model, train_loader, val_loader, attempt_index, epochs, lr, patience, device,
     all_metrics_df, hyperparams, task_names
 ):
+    import matplotlib.pyplot as plt
+
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=5, factor=0.5)
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
 
     best_val_acc = 0.0
     best_model_state = model.state_dict()
     no_improvement_epochs = 0
 
-    for epoch in tqdm(range(epochs), desc=f"Trial: {attempt_index}", unit="epoch"):
+    # For plotting
+    train_accs, val_accs = [], []
+    train_f1s, val_f1s = [], []
+
+    # Progress bar for epochs
+    epochs_pbar = tqdm(range(epochs), desc=f"Trial: {attempt_index}", unit="epoch")
+
+    for epoch in epochs_pbar:
         # --- Training ---
         model.train()
         train_preds, train_targets = [], []
@@ -396,8 +420,15 @@ def train_model(
         # --- Metrics ---
         row = {"trial_id": attempt_index, "epoch": epoch + 1}
         # Compute metrics for train and val
-        train_metrics = compute_metrics(train_targets, train_preds, train_targets, task_names)
-        val_metrics = compute_metrics(val_targets, val_preds, val_targets, task_names)
+        train_metrics = model.evaluate(train_targets, train_preds)
+        val_metrics = model.evaluate(val_targets, val_preds)
+
+        # Store for plotting
+        train_accs.append(train_metrics["overall_accuracy"])
+        val_accs.append(val_metrics["overall_accuracy"])
+        train_f1s.append(train_metrics["overall_F1"])
+        val_f1s.append(val_metrics["overall_F1"])
+
         # Fill DataFrame row for all columns
         for split, metrics_dict in zip(["train", "val"], [train_metrics, val_metrics]):
             for key, value in metrics_dict.items():
@@ -426,7 +457,33 @@ def train_model(
             break
         scheduler.step(val_acc)
 
+        # Update progress bar
+        epochs_pbar.set_postfix(
+            train_accuracy=train_metrics["overall_accuracy"],
+            val_accuracy=val_metrics["overall_accuracy"],
+            train_F1=train_metrics["overall_F1"],
+            val_F1=val_metrics["overall_F1"],
+            train_recall=train_metrics["overall_recall"],
+            val_recall=val_metrics["overall_recall"],
+            train_precision=train_metrics["overall_precision"],
+            val_precision=val_metrics["overall_precision"]
+        )
+
     model.load_state_dict(best_model_state)
+
+    # --- Plotting ---
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_accs, label="Train Accuracy")
+    plt.plot(val_accs, label="Val Accuracy")
+    plt.plot(train_f1s, label="Train F1", linestyle="--")
+    plt.plot(val_f1s, label="Val F1", linestyle="--")
+    plt.xlabel("Epoch")
+    plt.ylabel("Score")
+    plt.title(f"Training/Validation Accuracy & F1 (Trial {attempt_index})")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
     return best_val_acc, all_metrics_df
 
 # --- Optuna workflow ---
@@ -434,23 +491,23 @@ def objective(trial, all_metrics_df, train_data, train_df, device):
     # Define all hyperparameters
     hyperparams = {
         "input_channels": train_data.shape[1],
-        "num_temporal_filters": trial.suggest_categorical('num_temporal_filters', [8, 16, 32]),
-        "temporal_kernel_size": trial.suggest_categorical('temporal_kernel_size', [32, 64, 128]),
-        "dropout_rate": trial.suggest_float('dropout_rate', 0.2, 0.7, step=0.1),
+        "num_temporal_filters": trial.suggest_categorical('num_temporal_filters', [8, 16]),  # reduce max
+        "temporal_kernel_size": trial.suggest_categorical('temporal_kernel_size', [32, 64]),  # reduce max
+        "dropout_rate": trial.suggest_float('dropout_rate', 0.5, 0.8, step=0.1),  # increase min/max
         "activation": trial.suggest_categorical('activation', ['relu', 'gelu']),
-        "pool_size": trial.suggest_categorical('pool_size', [2, 4, 8]),
+        "pool_size": trial.suggest_categorical('pool_size', [2, 4]),
         "num_classes": len(np.unique(train_df['task_type'])),
-        "conv2d_channels": trial.suggest_categorical("conv2d_channels", [(128, 256), (64, 128), (256, 512)]),
-        "transformer_d_model": trial.suggest_categorical('transformer_d_model', [128, 256, 512]),
-        "transformer_nhead": trial.suggest_categorical('transformer_nhead', [4, 8, 16]),
-        "transformer_dim_feedforward": trial.suggest_categorical('transformer_dim_feedforward', [256, 512, 1024]),
-        "transformer_layers": trial.suggest_int('transformer_layers', 2, 6),
-        "fc_hidden": trial.suggest_categorical('fc_hidden', [64, 128, 256]),
-        "fc_dropout": trial.suggest_float('fc_dropout', 0.1, 0.5, step=0.1),
-        "learning_rate": trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True),
-        "batch_size": trial.suggest_categorical('batch_size', [32, 64, 128]),
+        "conv2d_channels": trial.suggest_categorical("conv2d_channels", ["64_128"]),  # only smaller
+        "transformer_d_model": trial.suggest_categorical('transformer_d_model', [128]),  # only smaller
+        "transformer_nhead": trial.suggest_categorical('transformer_nhead', [4]),  # only smaller
+        "transformer_dim_feedforward": trial.suggest_categorical('transformer_dim_feedforward', [128, 256]),  # reduce max
+        "transformer_layers": trial.suggest_int('transformer_layers', 1, 1),  # only 1 layer
+        "fc_hidden": trial.suggest_categorical('fc_hidden', [64, 128]),  # reduce max
+        "fc_dropout": trial.suggest_float('fc_dropout', 0.5, 0.8, step=0.1),  # increase min/max
+        "learning_rate": trial.suggest_float('learning_rate', 1e-4, 5e-3, log=True),  # keep as is or reduce max
+        "batch_size": trial.suggest_categorical('batch_size', [32, 64]),  # reduce max
         "input_time_length": trial.suggest_categorical('input_time_length', [256, 512]),
-        "stride": trial.suggest_categorical('stride', [32, 64, 128, 256])
+        "stride": trial.suggest_categorical('stride', [256, 512])  # large stride = less overlap
     }
 
     # When instantiating the model, unpack the dictionary:
@@ -458,7 +515,7 @@ def objective(trial, all_metrics_df, train_data, train_df, device):
 
 
     # DataLoaders
-    train_loader, val_loader, *_ = get_dataloaders(
+    train_loader, val_loader, train_X, train_y, val_X, val_y = get_dataloaders(
         train_data, train_df, batch_size=hyperparams["batch_size"],
         input_time_length=hyperparams["input_time_length"], stride=hyperparams["stride"]
     )
@@ -466,15 +523,15 @@ def objective(trial, all_metrics_df, train_data, train_df, device):
     # Train
     trial_index = trial.number + 1
     best_val_acc, updated_metrics_df = train_model(
-        model, train_loader, val_loader, attempt_index=trial_index, epochs=100, lr=hyperparams["learning_rate"],
-        patience=50, device=device, all_metrics_df=all_metrics_df, hyperparams=hyperparams, task_names=TASKS
+        model, train_loader, val_loader, attempt_index=trial_index, epochs=25, lr=hyperparams["learning_rate"],
+        patience=10, device=device, all_metrics_df=all_metrics_df, hyperparams=hyperparams, task_names=TASKS
     )
     # Update global metrics DataFrame
     all_metrics_df = updated_metrics_df
     return best_val_acc, all_metrics_df #  return negative accuracy for minimization and to update the DataFrame
 
 
-def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64):
+def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64, input_time_length=256, stride=128):
     """
     Evaluates the model on the test set and returns:
     - overall accuracy, F1, recall, precision
@@ -482,45 +539,14 @@ def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64):
     Assumes test_df['task_type'] contains the true labels (categorical codes in 'task_type_cat').
     """
     model.eval()
-    X = torch.tensor(test_data, dtype=torch.float32).to(device)
-    y_true = test_df['task_type_cat'].values
-    y_pred = []
 
-    with torch.no_grad():
-        for i in range(0, len(X), batch_size):
-            batch_X = X[i:i+batch_size]
-            outputs = model(batch_X)
-            preds = torch.argmax(outputs, dim=1).cpu().numpy()
-            y_pred.extend(preds)
+    # get test loader
+    test_loader, test_X, test_y = get_dataloader(data_tensor=test_data, df=test_df,
+                                        batch_size=batch_size, input_time_length=input_time_length,
+                                          stride=stride, shuffle=False)
+    # get test predictions
+    y_pred_test = model.predict(test_loader, device=device)
+    # evaluate the model's predictions on the test set
+    test_metrics = model.evaluate(y_pred=y_pred_test, y_true=test_y)
 
-    # Get task label mapping
-    if 'task_type_cat' in test_df.columns and 'task_type' in test_df.columns:
-        # Map category codes to names
-        cat_to_name = dict(enumerate(test_df['task_type'].astype('category').cat.categories))
-        task_names = [cat_to_name[i] for i in sorted(cat_to_name.keys())]
-        task_labels = list(cat_to_name.keys())
-    else:
-        # Fallback: just use unique codes
-        task_labels = sorted(np.unique(y_true))
-        task_names = [str(l) for l in task_labels]
-
-    # Compute metrics
-    metrics = compute_metrics(y_true, np.array(y_pred), task_labels=task_labels, task_names=task_names)
-
-    # Organize per-task metrics
-    per_task_metrics = {}
-    for idx, task in enumerate(task_names):
-        per_task_metrics[task] = {
-            "accuracy": metrics.get(f"{task}_accuracy", None),
-            "F1": metrics.get(f"{task}_F1", None),
-            "recall": metrics.get(f"{task}_recall", None),
-            "precision": metrics.get(f"{task}_precision", None),
-        }
-
-    overall_metrics = (
-        metrics["overall_accuracy"],
-        metrics["overall_F1"],
-        metrics["overall_recall"],
-        metrics["overall_precision"]
-    )
-    return overall_metrics, per_task_metrics
+    return test_metrics
