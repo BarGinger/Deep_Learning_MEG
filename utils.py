@@ -526,4 +526,4 @@ def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64, 
     # evaluate the model's predictions on the test set
     test_metrics = model.evaluate(y_pred=y_pred_test, y_true=test_y)
 
-    return test_metrics
+    return test_metrics # print 

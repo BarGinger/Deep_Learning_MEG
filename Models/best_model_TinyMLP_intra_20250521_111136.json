@@ -1,0 +1,20 @@
+{
+    "num_temporal_filters": 8,
+    "temporal_kernel_size": 64,
+    "dropout_rate": 0.6,
+    "activation": "relu",
+    "pool_size": 2,
+    "conv2d_channels": "64_128",
+    "transformer_d_model": 128,
+    "transformer_nhead": 4,
+    "transformer_dim_feedforward": 256,
+    "transformer_layers": 1,
+    "fc_hidden": 128,
+    "fc_dropout": 0.8,
+    "learning_rate": 0.00011289465828020333,
+    "batch_size": 32,
+    "input_time_length": 256,
+    "stride": 256,
+    "input_channels": 248,
+    "num_classes": 4
+}
