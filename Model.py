@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.optim import Adam
 import numpy as np
 from sklearn.metrics import accuracy_score, f1_score, recall_score, precision_score, confusion_matrix
 
@@ -17,9 +18,9 @@ class MEGClassifier(nn.Module):
         activation='elu',
         pool_size=4,
         num_classes=4,
-        conv2d_channels=[128, 256],
-        fc_hidden=128,
-        fc_dropout=0.3,
+        conv2d_channels=[32, 64]
+        fc_hidden=64
+        dropout_rate=0.6
         input_time_length=256
     ):
         super(MEGClassifier, self).__init__()
@@ -201,3 +202,6 @@ class TinyMLP(nn.Module):
                     results[f"{task}_recall"] = recall_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
                     results[f"{task}_precision"] = precision_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
         return results
+
+
+   

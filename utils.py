@@ -374,7 +374,8 @@ def train_model(
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=5, factor=0.5)
-    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    # criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = torch.nn.CrossEntropyLoss()
 
     best_val_acc = 0.0
     best_model_state = model.state_dict()
@@ -491,17 +492,17 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4):
         "input_channels": train_data.shape[1],
         "num_temporal_filters": trial.suggest_categorical('num_temporal_filters', [8, 16]),
         "temporal_kernel_size": trial.suggest_categorical('temporal_kernel_size', [32, 64]),
-        "dropout_rate": trial.suggest_float('dropout_rate', 0.5, 0.8, step=0.1),
+        "dropout_rate": trial.suggest_float('dropout_rate', 0.2, 0.6, step=0.1),
         "activation": trial.suggest_categorical('activation', ['relu', 'gelu']),
         "pool_size": trial.suggest_categorical('pool_size', [2, 4]),
         "num_classes": len(np.unique(train_df['task_type'])),
-        "conv2d_channels": trial.suggest_categorical("conv2d_channels", ["64_128"]),
+        "conv2d_channels": trial.suggest_categorical("conv2d_channels", ["32_64"]),
         "transformer_d_model": trial.suggest_categorical('transformer_d_model', [128]),
         "transformer_nhead": trial.suggest_categorical('transformer_nhead', [4]),
         "transformer_dim_feedforward": trial.suggest_categorical('transformer_dim_feedforward', [128, 256]),
         "transformer_layers": trial.suggest_int('transformer_layers', 1, 1),
         "fc_hidden": trial.suggest_categorical('fc_hidden', [64, 128]),
-        "fc_dropout": trial.suggest_float('fc_dropout', 0.5, 0.8, step=0.1),
+        "fc_dropout": trial.suggest_float('fc_dropout', 0.2, 0.6, step=0.1),
         "learning_rate": trial.suggest_float('learning_rate', 1e-4, 5e-3, log=True),
         "batch_size": trial.suggest_categorical('batch_size', [32, 64]),
         "input_time_length": trial.suggest_categorical('input_time_length', [256, 512]),
