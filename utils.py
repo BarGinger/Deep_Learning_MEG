@@ -36,6 +36,8 @@ import optuna
 import json
 from Model import MEGClassifier, TinyMLP
 from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.model_selection import StratifiedKFold
+
 
 # Gloval variables
 debug_mode = False
@@ -260,39 +262,54 @@ def get_dataloader(
     return loader, X, y
 
 
-def get_dataloaders(
-        data_tensor, df, batch_size=64, val_split=0.2, input_time_length=256, stride=128
-    ):
-    """
-    Split at the sample level, then extract windows for each split.
-    """
-    # Stratified split at the sample level
-    y = df['task_type_cat'].values
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=val_split, random_state=42)
-    train_idx, val_idx = next(sss.split(np.zeros(len(df)), y))
+# def get_dataloaders(
+#         data_tensor, df, batch_size=64, val_split=0.2, input_time_length=256, stride=128
+#     ):
+#     """
+#     Split at the sample level, then extract windows for each split.
+#     """
+#     # Stratified split at the sample level
+#     y = df['task_type_cat'].values
+#     sss = StratifiedShuffleSplit(n_splits=1, test_size=val_split, random_state=42)
+#     train_idx, val_idx = next(sss.split(np.zeros(len(df)), y))
 
-    # Split data and df
-    train_data, val_data = data_tensor[train_idx], data_tensor[val_idx]
-    train_df, val_df = df.iloc[train_idx].reset_index(drop=True), df.iloc[val_idx].reset_index(drop=True)
+#     # Split data and df
+#     train_data, val_data = data_tensor[train_idx], data_tensor[val_idx]
+#     train_df, val_df = df.iloc[train_idx].reset_index(drop=True), df.iloc[val_idx].reset_index(drop=True)
 
-    print("train task types counts:")
-    print(np.bincount(train_df['task_type'].astype('category').cat.codes))
-    print("val task types counts:")
-    print(np.bincount(val_df['task_type'].astype('category').cat.codes))
+#     print("train task types counts:")
+#     print(np.bincount(train_df['task_type'].astype('category').cat.codes))
+#     print("val task types counts:")
+#     print(np.bincount(val_df['task_type'].astype('category').cat.codes))
 
-    # Extract windows for each split
-    train_X, train_sample_indices = extract_sliding_windows(train_data, window_size=input_time_length, stride=stride)
-    val_X, val_sample_indices = extract_sliding_windows(val_data, window_size=input_time_length, stride=stride)
+#     # Extract windows for each split
+#     train_X, train_sample_indices = extract_sliding_windows(train_data, window_size=input_time_length, stride=stride)
+#     val_X, val_sample_indices = extract_sliding_windows(val_data, window_size=input_time_length, stride=stride)
 
-    train_y_full = train_df['task_type_cat'].values
-    val_y_full = val_df['task_type_cat'].values
+#     train_y_full = train_df['task_type_cat'].values
+#     val_y_full = val_df['task_type_cat'].values
 
-    train_y = torch.tensor(train_y_full[train_sample_indices], dtype=torch.long)
-    val_y = torch.tensor(val_y_full[val_sample_indices], dtype=torch.long)
+#     train_y = torch.tensor(train_y_full[train_sample_indices], dtype=torch.long)
+#     val_y = torch.tensor(val_y_full[val_sample_indices], dtype=torch.long)
 
-    train_loader = DataLoader(TensorDataset(train_X, train_y), batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(TensorDataset(val_X, val_y), batch_size=batch_size, shuffle=False)
-    return train_loader, val_loader, train_X, train_y, val_X, val_y
+#     train_loader = DataLoader(TensorDataset(train_X, train_y), batch_size=batch_size, shuffle=True)
+#     val_loader = DataLoader(TensorDataset(val_X, val_y), batch_size=batch_size, shuffle=False)
+#     return train_loader, val_loader, train_X, train_y, val_X, val_y
+
+
+def get_dataloaders(data_tensor, df, fold_index=None, n_splits=5, batch_size=64):
+    labels = df["task_type_cat"].values  # or whichever target you use
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    splits = list(skf.split(np.zeros(len(labels)), labels))
+    train_idx, val_idx = splits[fold_index]
+
+    train_dataset = TensorDataset(data_tensor[train_idx], torch.tensor(labels[train_idx]))
+    val_dataset = TensorDataset(data_tensor[val_idx], torch.tensor(labels[val_idx]))
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader
 
 ## tainging and logging related functions
 def create_metrics_df():
@@ -346,7 +363,7 @@ def create_metrics_df():
 
 def train_model(
     model, train_loader, val_loader, attempt_index, epochs, lr, patience, device,
-    all_metrics_df, hyperparams, task_names
+    all_metrics_df, hyperparams, task_names, fold_idx
 ):
     import matplotlib.pyplot as plt
 
@@ -395,7 +412,7 @@ def train_model(
         val_targets = np.array(val_targets)
 
         # --- Metrics ---
-        row = {"trial_id": attempt_index, "epoch": epoch + 1}
+        row = {"trial_id": attempt_index, "epoch": epoch + 1, "fold_index": fold_idx}
         # Compute metrics for train and val
         train_metrics = model.evaluate(train_targets, train_preds)
         val_metrics = model.evaluate(val_targets, val_preds)
@@ -464,48 +481,64 @@ def train_model(
     return best_val_acc, all_metrics_df
 
 # --- Optuna workflow ---
-def objective(trial, all_metrics_df, train_data, train_df, device):
-    # Define all hyperparameters
+def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=3):
+    # Define hyperparameters using trial
     hyperparams = {
         "input_channels": train_data.shape[1],
-        "num_temporal_filters": trial.suggest_categorical('num_temporal_filters', [8, 16]),  # reduce max
-        "temporal_kernel_size": trial.suggest_categorical('temporal_kernel_size', [32, 64]),  # reduce max
-        "dropout_rate": trial.suggest_float('dropout_rate', 0.5, 0.8, step=0.1),  # increase min/max
+        "num_temporal_filters": trial.suggest_categorical('num_temporal_filters', [8, 16]),
+        "temporal_kernel_size": trial.suggest_categorical('temporal_kernel_size', [32, 64]),
+        "dropout_rate": trial.suggest_float('dropout_rate', 0.5, 0.8, step=0.1),
         "activation": trial.suggest_categorical('activation', ['relu', 'gelu']),
         "pool_size": trial.suggest_categorical('pool_size', [2, 4]),
         "num_classes": len(np.unique(train_df['task_type'])),
-        "conv2d_channels": trial.suggest_categorical("conv2d_channels", ["64_128"]),  # only smaller
-        "transformer_d_model": trial.suggest_categorical('transformer_d_model', [128]),  # only smaller
-        "transformer_nhead": trial.suggest_categorical('transformer_nhead', [4]),  # only smaller
-        "transformer_dim_feedforward": trial.suggest_categorical('transformer_dim_feedforward', [128, 256]),  # reduce max
-        "transformer_layers": trial.suggest_int('transformer_layers', 1, 1),  # only 1 layer
-        "fc_hidden": trial.suggest_categorical('fc_hidden', [64, 128]),  # reduce max
-        "fc_dropout": trial.suggest_float('fc_dropout', 0.5, 0.8, step=0.1),  # increase min/max
-        "learning_rate": trial.suggest_float('learning_rate', 1e-4, 5e-3, log=True),  # keep as is or reduce max
-        "batch_size": trial.suggest_categorical('batch_size', [32, 64]),  # reduce max
+        "conv2d_channels": trial.suggest_categorical("conv2d_channels", ["64_128"]),
+        "transformer_d_model": trial.suggest_categorical('transformer_d_model', [128]),
+        "transformer_nhead": trial.suggest_categorical('transformer_nhead', [4]),
+        "transformer_dim_feedforward": trial.suggest_categorical('transformer_dim_feedforward', [128, 256]),
+        "transformer_layers": trial.suggest_int('transformer_layers', 1, 1),
+        "fc_hidden": trial.suggest_categorical('fc_hidden', [64, 128]),
+        "fc_dropout": trial.suggest_float('fc_dropout', 0.5, 0.8, step=0.1),
+        "learning_rate": trial.suggest_float('learning_rate', 1e-4, 5e-3, log=True),
+        "batch_size": trial.suggest_categorical('batch_size', [32, 64]),
         "input_time_length": trial.suggest_categorical('input_time_length', [256, 512]),
-        "stride": trial.suggest_categorical('stride', [256, 512])  # large stride = less overlap
+        "stride": trial.suggest_categorical('stride', [256, 512])
     }
 
-    # When instantiating the model, unpack the dictionary:
-    # model = MEGClassifier(**{k: v for k, v in hyperparams.items() if k in MEGClassifier.__init__.__code__.co_varnames}).to(device)
-    model = TinyMLP(**{k: v for k, v in hyperparams.items() if k in TinyMLP.__init__.__code__.co_varnames}).to(device)
+    val_accs = []
 
-    # DataLoaders
-    train_loader, val_loader, train_X, train_y, val_X, val_y = get_dataloaders(
-        train_data, train_df, batch_size=hyperparams["batch_size"],
-        input_time_length=hyperparams["input_time_length"], stride=hyperparams["stride"]
-    )
+    hyperparams["input_time_length"] = train_data.shape[2]
 
-    # Train
-    trial_index = trial.number + 1
-    best_val_acc, updated_metrics_df = train_model(
-        model, train_loader, val_loader, attempt_index=trial_index, epochs=25, lr=hyperparams["learning_rate"],
-        patience=10, device=device, all_metrics_df=all_metrics_df, hyperparams=hyperparams, task_names=TASKS
-    )
-    # Update global metrics DataFrame
-    all_metrics_df = updated_metrics_df
-    return best_val_acc, all_metrics_df #  return negative accuracy for minimization and to update the DataFrame
+    for fold_idx in range(n_splits):
+        train_loader, val_loader = get_dataloaders(
+            data_tensor=train_data,
+            df=train_df,
+            fold_index=fold_idx,
+            n_splits=n_splits,
+            batch_size=hyperparams["batch_size"]
+        )
+
+        model = MEGClassifier(**{k: v for k, v in hyperparams.items() if k in MEGClassifier.__init__.__code__.co_varnames}).to(device)    
+        # model = TinyMLP(**{k: v for k, v in hyperparams.items() if k in TinyMLP.__init__.__code__.co_varnames}).to(device)
+
+        trial_index = trial.number + 1
+        best_val_acc, updated_metrics_df = train_model(
+            model, train_loader, val_loader,
+            attempt_index=trial_index,
+            epochs=25,
+            lr=hyperparams["learning_rate"],
+            patience=10,
+            device=device,
+            all_metrics_df=all_metrics_df,
+            hyperparams=hyperparams,
+            task_names=TASKS,
+            fold_idx=fold_idx
+        )
+
+        val_accs.append(best_val_acc)
+        all_metrics_df = updated_metrics_df  # accumulate across folds
+
+    avg_val_acc = sum(val_accs) / len(val_accs)
+    return avg_val_acc, all_metrics_df
 
 
 def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64, input_time_length=256, stride=128):
