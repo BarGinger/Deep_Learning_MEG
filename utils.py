@@ -297,19 +297,23 @@ def get_dataloader(
 #     return train_loader, val_loader, train_X, train_y, val_X, val_y
 
 
-def get_dataloaders(data_tensor, df, fold_index=None, n_splits=5, batch_size=64):
+def get_dataloaders(data_tensor, df, fold_index=None, n_splits=4, batch_size=64):
     labels = df["task_type_cat"].values  # or whichever target you use
 
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     splits = list(skf.split(np.zeros(len(labels)), labels))
     train_idx, val_idx = splits[fold_index]
+    
+    train_df = df.iloc[train_idx]
+    val_df = df.iloc[val_idx]
+    
 
     train_dataset = TensorDataset(data_tensor[train_idx], torch.tensor(labels[train_idx]))
     val_dataset = TensorDataset(data_tensor[val_idx], torch.tensor(labels[val_idx]))
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    return train_loader, val_loader
+    return train_loader, val_loader, train_df, val_df
 
 ## tainging and logging related functions
 def create_metrics_df():
@@ -481,7 +485,7 @@ def train_model(
     return best_val_acc, all_metrics_df
 
 # --- Optuna workflow ---
-def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=3):
+def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4):
     # Define hyperparameters using trial
     hyperparams = {
         "input_channels": train_data.shape[1],
@@ -509,13 +513,20 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=3):
     hyperparams["input_time_length"] = train_data.shape[2]
 
     for fold_idx in range(n_splits):
-        train_loader, val_loader = get_dataloaders(
+        train_loader, val_loader, train_df2, val_df2 = get_dataloaders(
             data_tensor=train_data,
             df=train_df,
             fold_index=fold_idx,
             n_splits=n_splits,
             batch_size=hyperparams["batch_size"]
         )
+
+
+
+        print("train task types counts:")
+        print(np.bincount(train_df2['task_type'].astype('category').cat.codes))
+        print("validation task types counts:")
+        print(np.bincount(val_df2['task_type'].astype('category').cat.codes))
 
         model = MEGClassifier(**{k: v for k, v in hyperparams.items() if k in MEGClassifier.__init__.__code__.co_varnames}).to(device)    
         # model = TinyMLP(**{k: v for k, v in hyperparams.items() if k in TinyMLP.__init__.__code__.co_varnames}).to(device)
