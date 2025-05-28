@@ -580,7 +580,8 @@ def plot_performance(mean_train_acc, mean_val_acc, mean_train_loss, mean_val_los
 
     plt.title(f"Mean Train/Val Accuracy & Loss (Trial {trail_index})")
     plt.grid(True)
-    plt.savefig(f"./Output/mean_performance_trial_{trail_index}.png", bbox_inches='tight')
+    if path:
+        plt.savefig(path, bbox_inches='tight')
     plt.show()
     
 
@@ -782,7 +783,8 @@ def get_hyperparameter_search_space(trial, train_data):
     return hyperparams
 
 
-def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, best_model_path=None):
+def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, best_model_path=None,
+              plot_path=None):
     # Define hyperparameters using trial
     hyperparams = get_hyperparameter_search_space(trial, train_data)
 
@@ -869,13 +871,13 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
     plot_performance(
         mean_train_acc, mean_val_acc, mean_train_loss, mean_val_loss,
         trail_index=trial_index,
-        path=f"./Output/mean_performance_trial_{trial_index}.png"
+        path=plot_path
     )
 
     return avg_val_acc, all_metrics_df
 
 
-def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64, input_time_length=256, stride=128):
+def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64, input_time_length=256, stride=128, path=None):
     model.eval()
     if isinstance(model, MultiviewAttention):
         test_loader = get_multiview_dataloader(
@@ -901,5 +903,6 @@ def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64, 
         "y_pred": np.array(y_pred_test)
 
     })
-    df_test.to_csv("./Output/test_predictions.csv", index=False)
+    if path:
+        df_test.to_csv(path, index=False)
     return test_metrics
