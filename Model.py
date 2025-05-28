@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.optim import Adam
 import numpy as np
 from sklearn.metrics import accuracy_score, f1_score, recall_score, precision_score, confusion_matrix
 import torch.nn.functional as F
@@ -363,3 +364,6 @@ class MultiviewAttention(nn.Module):
                     results[f"{task}_recall"] = recall_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
                     results[f"{task}_precision"] = precision_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
         return results
+
+
+   
