@@ -714,7 +714,7 @@ def get_hyperparameter_search_space(trial, train_data):
         dict: A dictionary containing the hyperparameter search space.
     """
     if ModelClass == MultiviewAttention:
-        window_size = trial.suggest_categorical('window_size', [4, 8])
+        window_size = trial.suggest_categorical('window_size', [2, 4, 8, 16])
         T = train_data.shape[2]
         split_size = T // window_size
 
@@ -729,34 +729,34 @@ def get_hyperparameter_search_space(trial, train_data):
 
 
         hyperparams = {
-            "window_size": trial.suggest_categorical('window_size', [4, 8]),
-            "conv1_filters": trial.suggest_categorical('conv1_filters', [16, 32]),
-            "conv2_filters": trial.suggest_categorical('conv2_filters', [32, 64]),
-            "conv3_filters": trial.suggest_categorical('conv3_filters', [64, 128]),
-            "conv1_kernel_shape": trial.suggest_categorical('conv1_kernel_shape', [(3, 3), (5, 5)]),
-            "conv2_kernel_shape": trial.suggest_categorical('conv2_kernel_shape', [(3, 3), (5, 5)]),
-            "conv3_kernel_shape": trial.suggest_categorical('conv3_kernel_shape', [(3, 3), (5, 5)]),
-            "padding1": trial.suggest_categorical('padding1', [1, 2]),
-            "padding2": trial.suggest_categorical('padding2', [1, 2]),
-            "padding3": trial.suggest_categorical('padding3', [1, 2]),
-            "conv1_activation": trial.suggest_categorical('conv1_activation', ['relu', 'elu']),
-            "conv2_activation": trial.suggest_categorical('conv2_activation', ['relu', 'elu']),
-            "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'elu']),
+            "window_size": window_size,
+            "conv1_filters": trial.suggest_categorical('conv1_filters', [16, 32, 64]),
+            "conv2_filters": trial.suggest_categorical('conv2_filters', [32, 64, 128]),
+            "conv3_filters": trial.suggest_categorical('conv3_filters', [64, 128, 256]),
+            "conv1_kernel_shape": trial.suggest_categorical('conv1_kernel_shape', [(3, 3), (5, 5), (7, 7)]),
+            "conv2_kernel_shape": trial.suggest_categorical('conv2_kernel_shape', [(3, 3), (5, 5), (7, 7)]),
+            "conv3_kernel_shape": trial.suggest_categorical('conv3_kernel_shape', [(3, 3), (5, 5), (7, 7)]),
+            "padding1": trial.suggest_categorical('padding1', [0, 1, 2, 3]),
+            "padding2": trial.suggest_categorical('padding2', [0, 1, 2, 3]),
+            "padding3": trial.suggest_categorical('padding3', [0, 1, 2, 3]),
+            "conv1_activation": trial.suggest_categorical('conv1_activation', ['relu', 'elu', 'leaky_relu']),
+            "conv2_activation": trial.suggest_categorical('conv2_activation', ['relu', 'elu', 'leaky_relu']),
+            "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'elu', 'leaky_relu']),
             "dense_nodes": trial.suggest_categorical('dense_nodes', [64, 128]),
             "dense_activation": trial.suggest_categorical('dense_activation', ['relu', 'elu']),
             "depth": trial.suggest_categorical('depth', [train_data.shape[1]]),  # or set appropriately
-            "lstm1_cells": trial.suggest_categorical('lstm1_cells', [64, 128]),
-            "lstm2_cells": trial.suggest_categorical('lstm2_cells', [32, 64]),
-            "dense3_nodes": trial.suggest_categorical('dense3_nodes', [32, 64]),
+            "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 64, 128]),
+            "lstm2_cells": trial.suggest_categorical('lstm2_cells', [32, 64, 128]),
+            "dense3_nodes": trial.suggest_categorical('dense3_nodes', [32, 64, 128]),
             "dense3_activation": trial.suggest_categorical('dense3_activation', ['relu', 'elu']),
             "number_classes": len(np.unique(TASKS)),
             "number_channels": train_data.shape[1],  # or set appropriately
             "mesh_rows": mesh_rows,
             "mesh_columns": mesh_columns,
             "split_size": split_size,
-            "learning_rate": trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True),
-            "batch_size": trial.suggest_categorical('batch_size', [16, 32, 64]),
-            "dropout_rate": trial.suggest_float('dropout_rate', 0.3, 0.5, step=0.1),
+            "learning_rate": trial.suggest_float('learning_rate', 5e-5, 5e-2, log=True),
+            "batch_size": trial.suggest_categorical('batch_size', [8, 16, 32, 64]),
+            "dropout_rate": trial.suggest_float('dropout_rate', 0.1, 0.7, step=0.1),
         }
     else:
         hyperparams = {
@@ -829,7 +829,7 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
         best_val_acc, updated_metrics_df, train_accs, val_accs_fold, train_losses, val_losses = train_model(
             model, train_loader, val_loader,
             attempt_index=trial_index,
-            epochs=50,
+            epochs=25,
             lr=hyperparams["learning_rate"],
             patience=5,
             device=device,
@@ -898,11 +898,12 @@ def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64, 
     y_pred_test = model.predict(test_loader, device=device)
     test_metrics = model.evaluate(y_pred=y_pred_test, y_true=test_y)
 
-    df_test = pd.DataFrame({
+    df_test_result = pd.DataFrame({
         "y_true": np.array(test_y),
-        "y_pred": np.array(y_pred_test)
+        "y_pred": np.array(y_pred_test),
+        "patient_id": test_df['patient_id']
 
     })
     if path:
-        df_test.to_csv(path, index=False)
-    return test_metrics
+        df_test_result.to_csv(path, index=False)
+    return test_metrics, df_test_result
