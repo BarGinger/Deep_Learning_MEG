@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from sklearn.metrics import accuracy_score, f1_score, recall_score, precision_score, confusion_matrix
+import torch.nn.functional as F
 
 class MEGClassifier(nn.Module):
     """
@@ -10,13 +11,13 @@ class MEGClassifier(nn.Module):
     def __init__(
         self,
         tasks=["resting", "math", "memory", "motor"],
-        input_channels=248,
+        number_channels=248,
         num_temporal_filters=8,
         temporal_kernel_size=64,
         dropout_rate=0.5,
         activation='elu',
         pool_size=4,
-        num_classes=4,
+        number_classes=4,
         conv2d_channels=[128, 256],
         fc_hidden=128,
         fc_dropout=0.3,
@@ -39,7 +40,7 @@ class MEGClassifier(nn.Module):
 
         # 1D CNN for Temporal Feature Extraction
         self.cnn1d = nn.Sequential(
-            nn.Conv1d(input_channels, num_temporal_filters, kernel_size=temporal_kernel_size, stride=1, padding=temporal_kernel_size // 2),
+            nn.Conv1d(number_channels, num_temporal_filters, kernel_size=temporal_kernel_size, stride=1, padding=temporal_kernel_size // 2),
             nn.BatchNorm1d(num_temporal_filters),
             act_fn,
             nn.MaxPool1d(kernel_size=pool_size),
@@ -61,7 +62,7 @@ class MEGClassifier(nn.Module):
 
         # Calculate flattened feature size after CNNs for FC input
         with torch.no_grad():
-            dummy = torch.zeros(1, input_channels, input_time_length)
+            dummy = torch.zeros(1, number_channels, input_time_length)
             dummy = self.cnn1d(dummy)
             dummy = dummy.unsqueeze(1)
             dummy = self.cnn2d(dummy)
@@ -74,14 +75,14 @@ class MEGClassifier(nn.Module):
             nn.Linear(flattened_size, fc_hidden),
             act_fn,
             nn.Dropout(fc_dropout),
-            nn.Linear(fc_hidden, num_classes)
+            nn.Linear(fc_hidden, number_classes)
         )
 
     def forward(self, x):
         x = self.cnn1d(x)  # (batch, num_temporal_filters, time')
         x = x.unsqueeze(1) # (batch, 1, channels, time')
         x = self.cnn2d(x)  # (batch, last_conv2d_channel, ch', t')
-        x = self.fc(x)     # (batch, num_classes)
+        x = self.fc(x)     # (batch, number_classes)
         return x
 
     def predict(self, loader, device=None):
@@ -123,25 +124,104 @@ class MEGClassifier(nn.Module):
                     results[f"{task}_recall"] = recall_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
                     results[f"{task}_precision"] = precision_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
         return results
-    
 
-class TinyMLP(nn.Module):
-    """
-    Simple MLP for MEG/EEG classification. Suitable for very small datasets.
-    """
+
+class MultiviewDataset(torch.utils.data.Dataset):
+    def __init__(self, X, y, window_size, mesh_rows, mesh_columns, depth):
+        """
+        X: (N, C, T) torch.Tensor
+        y: (N,) torch.Tensor
+        window_size: int
+        mesh_rows, mesh_columns, depth: int
+        """
+        self.X = X
+        self.y = y
+        self.window_size = window_size
+        self.mesh_rows = mesh_rows
+        self.mesh_columns = mesh_columns
+        self.depth = depth
+
+        x_sample = self.X[0]  # shape: (C, T)
+        T = x_sample.shape[1]
+        split_size = T // self.window_size
+        self.split_size = split_size
+
+    def __len__(self):
+        return self.X.shape[0]
+
+    def __getitem__(self, idx):
+        x_sample = self.X[idx]  # shape: (C, T)
+        T = x_sample.shape[1]
+        split_size = T // self.window_size
+        if split_size != self.mesh_rows * self.mesh_columns:
+            raise ValueError(
+                f"split_size ({split_size}) != mesh_rows * mesh_columns ({self.mesh_rows * self.mesh_columns}). "
+                f"Check your window_size, mesh_rows, mesh_columns, and input data shape."
+            )
+        x_cnn_list = []
+        x_lstm_list = []
+        for i in range(self.window_size):
+            start = i * split_size
+            end = start + split_size
+            window = x_sample[:, start:end]  # shape: (C, split_size)
+            x_cnn = window[:self.depth].reshape(self.depth, self.mesh_rows, self.mesh_columns)
+            x_cnn_list.append(x_cnn)
+            x_lstm = window[:self.depth].T  # shape: (split_size, depth)
+            x_lstm_list.append(x_lstm)
+        return x_cnn_list, x_lstm_list, self.y[idx]    
+    
+    
+# Add this helper class at the top of your Model.py
+class Permute(nn.Module):
+    def __init__(self, *dims):
+        super().__init__()
+        self.dims = dims
+    def forward(self, x):
+        return x.permute(*self.dims)
+
+class MultiviewAttention(nn.Module):
     def __init__(
         self,
-        tasks=["resting", "math", "memory", "motor"],
-        input_channels=248,
-        input_time_length=256,
-        fc_hidden=32,
-        fc_dropout=0.3,
-        num_classes=4,
-        activation='relu'
+        window_size,
+        conv1_filters,
+        conv2_filters,
+        conv3_filters,
+        conv1_kernel_shape,
+        conv2_kernel_shape,
+        conv3_kernel_shape,
+        padding1,
+        padding2,
+        padding3,
+        conv1_activation,
+        conv2_activation,
+        conv3_activation,
+        dense_nodes,
+        dense_activation,
+        depth,
+        lstm1_cells,
+        lstm2_cells,
+        dense3_nodes,
+        dense3_activation,
+        dropout_rate=0.5,
+        number_classes=4,
+        number_channels=248,
+        mesh_rows=20,
+        mesh_columns=21,
+        split_size=None        
     ):
-        super(TinyMLP, self).__init__()
-        self.tasks = tasks
+        super().__init__()
+        self.window_size = window_size
+        self.number_classes = number_classes
+        self.number_channels = number_channels
+        self.mesh_rows = mesh_rows
+        self.mesh_columns = mesh_columns
+        self.depth = depth
+        self.tasks = ["resting", "math", "memory", "motor"]
+        self.split_size = split_size
+        self.dropout_rate = dropout_rate
+        self.dropout = nn.Dropout(self.dropout_rate)
 
+        # Activation functions
         activations = {
             'relu': nn.ReLU(),
             'elu': nn.ELU(),
@@ -149,30 +229,112 @@ class TinyMLP(nn.Module):
             'leakyrelu': nn.LeakyReLU(),
             'tanh': nn.Tanh()
         }
-        act_fn = activations.get(activation.lower(), nn.ReLU())
+        act1 = activations.get(conv1_activation.lower(), nn.ReLU())
+        act2 = activations.get(conv2_activation.lower(), nn.ReLU())
+        act3 = activations.get(conv3_activation.lower(), nn.ReLU())
+        act_dense = activations.get(dense_activation.lower(), nn.ReLU())
+        act_dense3 = activations.get(dense3_activation.lower(), nn.ReLU())
 
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(input_channels * input_time_length, fc_hidden),
-            act_fn,
-            nn.Dropout(fc_dropout),
-            nn.Linear(fc_hidden, num_classes)
-        )
+        # CNN branches for each window (up to flatten)
+        self.cnn_branches = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(depth, conv1_filters, kernel_size=conv1_kernel_shape, padding=padding1),
+                nn.BatchNorm2d(conv1_filters),
+                act1,
+                nn.Conv2d(conv1_filters, conv2_filters, kernel_size=conv2_kernel_shape, padding=padding2),
+                act2,
+                nn.Conv2d(conv2_filters, conv3_filters, kernel_size=conv3_kernel_shape, padding=padding3),
+                act3,
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(start_dim=1)
+            ) for _ in range(window_size)
+        ])
 
-    def forward(self, x):
-        return self.fc(x)
+        # Dynamically compute flattened size for FC layer
+        with torch.no_grad():
+            dummy = torch.zeros(1, depth, mesh_rows, mesh_columns)
+            dummy_out = self.cnn_branches[0](dummy)
+            flattened_size = dummy_out.shape[1]
+
+        # Dense after CNN branch
+        self.cnn_dense = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(flattened_size, dense_nodes),
+                act_dense,
+                nn.Dropout(self.dropout_rate) 
+            ) for _ in range(window_size)
+        ])
+
+        # Self-attention mechanism
+        self.attention = nn.MultiheadAttention(embed_dim=dense_nodes, num_heads=4, batch_first=True)
+
+        # LSTM branches for each window
+        self.lstm_dense = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(depth, dense_nodes),
+                act_dense
+            ) for _ in range(window_size)
+        ])
+
+        # LSTM layers
+        self.lstm1 = nn.LSTM(dense_nodes, lstm1_cells, batch_first=True)
+        self.lstm2 = nn.LSTM(lstm1_cells, lstm2_cells, batch_first=True)
+
+        # Dense after LSTM
+        self.dense3 = nn.Linear(lstm2_cells, dense3_nodes)
+        self.dense3_act = act_dense3
+
+        # Final layers
+        self.final_add = nn.Linear(dense_nodes, dense_nodes)  # for addition, if needed
+        self.final_out = nn.Linear(dense3_nodes + dense_nodes + dense_nodes, number_classes)
+
+    def forward(self, x_cnn_list, x_lstm_list):
+        # x_cnn_list: list of [batch, depth, mesh_rows, mesh_columns]
+        # x_lstm_list: list of [batch, number_channels, depth]
+        cnn_outs = []
+        for i, (branch, dense) in enumerate(zip(self.cnn_branches, self.cnn_dense)):
+            out = branch(x_cnn_list[i])
+            out = dense(out)
+            cnn_outs.append(out)
+        
+        lstm_in = []
+        for branch, x_lstm in zip(self.lstm_dense, x_lstm_list):
+            # x_lstm: (batch, split_size, depth)
+            out = branch(x_lstm)  # (batch, split_size, dense_nodes)
+            out = out.mean(dim=1) # (batch, dense_nodes)
+            lstm_in.append(out)
+        lstm_in = torch.stack(lstm_in, dim=1)  # (batch, window_size, dense_nodes)
+        
+        # Apply self-attention across windows
+        attn_output, _ = self.attention(lstm_in, lstm_in, lstm_in)
+        attn_feat = self.dropout(attn_output.mean(dim=1))  # Dropout added here
+
+
+        lstm_out, _ = self.lstm1(lstm_in)
+        lstm_out, _ = self.lstm2(lstm_out)
+        lstm_feat = self.dense3_act(self.dense3(lstm_out[:, -1, :]))
+        lstm_feat = self.dropout(lstm_feat)  # Dropout after activation
+
+        added = self.dropout(torch.stack(cnn_outs, dim=0).sum(dim=0))
+        final = torch.cat([lstm_feat, added, attn_feat], dim=-1)
+        final = self.dropout(final)  # Optional: before final classifier
+
+        out = self.final_out(final)
+        return out
 
     def predict(self, loader, device=None):
         preds = []
+        self.eval()
         with torch.no_grad():
             for batch in loader:
                 if isinstance(batch, (list, tuple)):
-                    batch_x = batch[0]
+                    batch_x_cnn, batch_x_lstm = batch[0], batch[1]
                 else:
-                    batch_x = batch
+                    batch_x_cnn, batch_x_lstm = batch, batch
                 if device is not None:
-                    batch_x = batch_x.to(device)
-                outputs = self.forward(batch_x)
+                    batch_x_cnn = [x.to(device) for x in batch_x_cnn]
+                    batch_x_lstm = [x.to(device) for x in batch_x_lstm]
+                outputs = self.forward(batch_x_cnn, batch_x_lstm)
                 batch_preds = torch.argmax(outputs, dim=1).cpu().numpy()
                 preds.extend(batch_preds)
         return np.array(preds)
@@ -187,7 +349,7 @@ class TinyMLP(nn.Module):
         results["overall_F1"] = f1_score(y_true, y_pred, average='macro', zero_division=0)
         results["overall_recall"] = recall_score(y_true, y_pred, average='macro', zero_division=0)
         results["overall_precision"] = precision_score(y_true, y_pred, average='macro', zero_division=0)
-        if self.tasks is not None and len(self.tasks) > 1:
+        if hasattr(self, "tasks") and self.tasks is not None and len(self.tasks) > 1:
             for idx, task in enumerate(self.tasks):
                 mask = (y_true == idx)
                 if np.sum(mask) == 0:
