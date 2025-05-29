@@ -239,13 +239,21 @@ class MultiviewAttention(nn.Module):
         # CNN branches for each window (up to flatten)
         self.cnn_branches = nn.ModuleList([
             nn.Sequential(
+                # Permute(0, 1, 2, 3),
                 nn.Conv2d(depth, conv1_filters, kernel_size=conv1_kernel_shape, padding=padding1),
                 nn.BatchNorm2d(conv1_filters),
                 act1,
+                nn.Dropout(self.dropout_rate),
+                
                 nn.Conv2d(conv1_filters, conv2_filters, kernel_size=conv2_kernel_shape, padding=padding2),
+                nn.BatchNorm2d(conv2_filters),
                 act2,
+                nn.Dropout(self.dropout_rate),
+                
                 nn.Conv2d(conv2_filters, conv3_filters, kernel_size=conv3_kernel_shape, padding=padding3),
+                nn.BatchNorm2d(conv3_filters),
                 act3,
+                nn.Dropout(self.dropout_rate),
                 nn.AdaptiveAvgPool2d((1, 1)),
                 nn.Flatten(start_dim=1)
             ) for _ in range(window_size)
@@ -277,6 +285,13 @@ class MultiviewAttention(nn.Module):
             ) for _ in range(window_size)
         ])
 
+        self.lstm_temporal_attention = nn.Sequential(
+            nn.Linear(dense_nodes, 64),
+            nn.Tanh(),
+            nn.Linear(64, 1)
+        )
+
+
         # LSTM layers
         self.lstm1 = nn.LSTM(dense_nodes, lstm1_cells, batch_first=True)
         self.lstm2 = nn.LSTM(lstm1_cells, lstm2_cells, batch_first=True)
@@ -302,7 +317,12 @@ class MultiviewAttention(nn.Module):
         for branch, x_lstm in zip(self.lstm_dense, x_lstm_list):
             # x_lstm: (batch, split_size, depth)
             out = branch(x_lstm)  # (batch, split_size, dense_nodes)
-            out = out.mean(dim=1) # (batch, dense_nodes)
+            # out = out.max(dim=1).values # (batch, dense_nodes)
+            # Attention pooling
+            attn_weights = self.lstm_temporal_attention(out).squeeze(-1)  # (batch, split_size)
+            attn_weights = F.softmax(attn_weights, dim=1).unsqueeze(-1)   # (batch, split_size, 1)
+            out = (out * attn_weights).sum(dim=1)  # Weighted sum: (batch, dense_nodes)
+            
             lstm_in.append(out)
         lstm_in = torch.stack(lstm_in, dim=1)  # (batch, window_size, dense_nodes)
         
