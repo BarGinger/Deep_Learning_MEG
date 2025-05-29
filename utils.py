@@ -517,9 +517,13 @@ def get_multiview_dataloaders(
 ):
     """
     Like get_dataloaders, but for MultiviewDataset.
+    Ensures each fold has a good distribution of each patient and each task type.
     Returns: train_loader, val_loader, train_df, val_df
     """
-    labels = df["task_type_cat"].values
+    # Combine patient_id and task_type_cat for stratification
+    stratify_col = df["patient_id"].astype(str) + "_" + df["task_type_cat"].astype(str)
+    labels = stratify_col.values
+
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     splits = list(skf.split(np.zeros(len(labels)), labels))
     train_idx, val_idx = splits[fold_index]
@@ -730,9 +734,9 @@ def get_hyperparameter_search_space(trial, train_data):
 
         hyperparams = {
             "window_size": window_size,
-            "conv1_filters": trial.suggest_categorical('conv1_filters', [16, 32, 64]),
-            "conv2_filters": trial.suggest_categorical('conv2_filters', [32, 64, 128]),
-            "conv3_filters": trial.suggest_categorical('conv3_filters', [64, 128, 256]),
+            "conv1_filters": trial.suggest_categorical('conv1_filters', [16, 32, 64, 128, 256]),
+            "conv2_filters": trial.suggest_categorical('conv2_filters', [32, 64, 128, 256]),
+            "conv3_filters": trial.suggest_categorical('conv3_filters', [64, 128, 256, 512]),
             "conv1_kernel_shape": trial.suggest_categorical('conv1_kernel_shape', [(3, 3), (5, 5), (7, 7)]),
             "conv2_kernel_shape": trial.suggest_categorical('conv2_kernel_shape', [(3, 3), (5, 5), (7, 7)]),
             "conv3_kernel_shape": trial.suggest_categorical('conv3_kernel_shape', [(3, 3), (5, 5), (7, 7)]),
@@ -742,12 +746,12 @@ def get_hyperparameter_search_space(trial, train_data):
             "conv1_activation": trial.suggest_categorical('conv1_activation', ['relu', 'elu', 'leaky_relu']),
             "conv2_activation": trial.suggest_categorical('conv2_activation', ['relu', 'elu', 'leaky_relu']),
             "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'elu', 'leaky_relu']),
-            "dense_nodes": trial.suggest_categorical('dense_nodes', [64, 128]),
+            "dense_nodes": trial.suggest_categorical('dense_nodes', [64, 128, 256]),
             "dense_activation": trial.suggest_categorical('dense_activation', ['relu', 'elu']),
             "depth": trial.suggest_categorical('depth', [train_data.shape[1]]),  # or set appropriately
             "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 64, 128]),
             "lstm2_cells": trial.suggest_categorical('lstm2_cells', [32, 64, 128]),
-            "dense3_nodes": trial.suggest_categorical('dense3_nodes', [32, 64, 128]),
+            "dense3_nodes": trial.suggest_categorical('dense3_nodes', [32, 64, 128, 256]),
             "dense3_activation": trial.suggest_categorical('dense3_activation', ['relu', 'elu']),
             "number_classes": len(np.unique(TASKS)),
             "number_channels": train_data.shape[1],  # or set appropriately
@@ -829,7 +833,7 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
         best_val_acc, updated_metrics_df, train_accs, val_accs_fold, train_losses, val_losses = train_model(
             model, train_loader, val_loader,
             attempt_index=trial_index,
-            epochs=25,
+            epochs=50,
             lr=hyperparams["learning_rate"],
             patience=5,
             device=device,
