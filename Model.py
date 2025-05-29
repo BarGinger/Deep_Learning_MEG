@@ -385,5 +385,65 @@ class MultiviewAttention(nn.Module):
                     results[f"{task}_precision"] = precision_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
         return results
 
+class EEGNet(nn.Module):
+    def __init__(self, nb_classes, Channels, Samples, conv1_filters, conv2_filters,
+                 dropoutRate=0.5, kernLength=64,  
+                 depth=2, norm_rate=0.25, dropoutType='Dropout'):
+        super(EEGNet, self).__init__()
+
+        if dropoutType == 'SpatialDropout2D':
+            self.dropout = nn.Dropout2d
+        elif dropoutType == 'Dropout':
+            self.dropout = nn.Dropout
+        else:
+            raise ValueError("dropoutType must be one of 'SpatialDropout2D' or 'Dropout'.")
+
+        self.firstconv = nn.Sequential(
+            nn.Conv2d(1, conv1_filters, kernel_size=(1, kernLength), padding='same', bias=False),
+            nn.BatchNorm2d(conv1_filters)
+        )
+        
+
+        self.depthwiseConv = nn.Sequential(
+            nn.Conv2d(conv1_filters, conv1_filters * depth, kernel_size=(Channels, 1), groups=conv1_filters, bias=False),
+            nn.BatchNorm2d(conv1_filters * depth),
+            nn.ELU(),
+            nn.AvgPool2d(kernel_size=(1, 4)),
+            self.dropout(dropoutRate)
+        )
+
+        self.separableConv = nn.Sequential(
+            nn.Conv2d(conv1_filters * depth, conv1_filters * depth, kernel_size=(1, 16), groups=conv1_filters * depth, padding='same', bias=False),
+            nn.Conv2d(conv1_filters * depth, conv2_filters, kernel_size=1, bias=False),
+            nn.BatchNorm2d(conv2_filters),
+            nn.ELU(),
+            nn.AvgPool2d(kernel_size=(1, 8)),
+            self.dropout(dropoutRate)
+        )
+
+        # Compute output size after conv/pool layers
+        self._output_size = self._get_flattened_size(Channels, Samples)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(self._output_size, nb_classes),
+            nn.Softmax(dim=1)
+        )
+      
+
+    def _get_flattened_size(self, Channels, Samples):
+        with torch.no_grad():
+            x = torch.zeros(1, 1, Channels, Samples)
+            x = self.firstconv(x)
+            x = self.depthwiseConv(x)
+            x = self.separableConv(x)
+            return x.view(1, -1).shape[1]
+
+    def forward(self, x):
+        x = self.firstconv(x)
+        x = self.depthwiseConv(x)
+        x = self.separableConv(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
 
    
