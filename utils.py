@@ -38,6 +38,7 @@ from Model import MEGClassifier, MultiviewAttention, MultiviewDataset
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.model_selection import StratifiedKFold
 import matplotlib.pyplot as plt
+from sklearn.model_selection import GroupKFold
 
 
 # Gloval variables
@@ -511,21 +512,19 @@ def get_multiview_dataloader(data_tensor, df, batch_size, window_size, mesh_rows
     return loader
 
 
+
 def get_multiview_dataloaders(
     data_tensor, df, fold_index=None, n_splits=4, batch_size=64,
     window_size=4, mesh_rows=20, mesh_columns=21, depth=248
 ):
     """
     Like get_dataloaders, but for MultiviewDataset.
-    Ensures each fold has a good distribution of each patient and each task type.
+    Ensures each fold contains only unseen patients in validation.
     Returns: train_loader, val_loader, train_df, val_df
     """
-    # Combine patient_id and task_type_cat for stratification
-    stratify_col = df["patient_id"].astype(str) + "_" + df["task_type_cat"].astype(str)
-    labels = stratify_col.values
-
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    splits = list(skf.split(np.zeros(len(labels)), labels))
+    groups = df["patient_id"].values
+    gkf = GroupKFold(n_splits=n_splits)
+    splits = list(gkf.split(np.zeros(len(groups)), groups=groups))
     train_idx, val_idx = splits[fold_index]
 
     train_df2 = df.iloc[train_idx]
@@ -540,13 +539,8 @@ def get_multiview_dataloaders(
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=multiview_collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=multiview_collate_fn)
+    
     return train_loader, val_loader, train_df2, val_df2
-
-def get_training_parts(model, lr=1e-3, weight_decay=1e-4, max_epochs=100):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
-    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
-    return optimizer, scheduler, criterion
 
 
 def plot_performance(mean_train_acc, mean_val_acc, mean_train_loss, mean_val_loss, trail_index, path=None):
@@ -582,7 +576,7 @@ def plot_performance(mean_train_acc, mean_val_acc, mean_train_loss, mean_val_los
     ax2.set_ylabel("Loss")
     ax2.legend(loc='upper right')
 
-    plt.title(f"Mean Train/Val Accuracy & Loss (Trial {trail_index})")
+    plt.title(f"Mean Train/Val Accuracy & Loss (Trial {trail_index}) Overall Accuracy: {mean_val_acc[-1]:.4f})")
     plt.grid(True)
     if path:
         plt.savefig(path, bbox_inches='tight')
@@ -718,7 +712,7 @@ def get_hyperparameter_search_space(trial, train_data):
         dict: A dictionary containing the hyperparameter search space.
     """
     if ModelClass == MultiviewAttention:
-        window_size = trial.suggest_categorical('window_size', [2, 4, 8, 16])
+        window_size = trial.suggest_categorical('window_size', [4, 8, 16])
         T = train_data.shape[2]
         split_size = T // window_size
 
@@ -731,36 +725,40 @@ def get_hyperparameter_search_space(trial, train_data):
         mesh_rows = mesh_row_candidates[trial.suggest_int('mesh_rows_index', 0, len(mesh_row_candidates) - 1)]
         mesh_columns = split_size // mesh_rows
 
-
         hyperparams = {
-            "window_size": window_size,
-            "conv1_filters": trial.suggest_categorical('conv1_filters', [16, 32, 64, 128, 256]),
+            "window_size": trial.suggest_categorical('window_size', [4, 8, 16]),
+            "conv1_filters": trial.suggest_categorical('conv1_filters', [16, 32, 64, 128]),
             "conv2_filters": trial.suggest_categorical('conv2_filters', [32, 64, 128, 256]),
-            "conv3_filters": trial.suggest_categorical('conv3_filters', [64, 128, 256, 512]),
+            "conv3_filters": trial.suggest_categorical('conv3_filters', [64, 128, 256]),
             "conv1_kernel_shape": trial.suggest_categorical('conv1_kernel_shape', [(3, 3), (5, 5), (7, 7)]),
             "conv2_kernel_shape": trial.suggest_categorical('conv2_kernel_shape', [(3, 3), (5, 5), (7, 7)]),
             "conv3_kernel_shape": trial.suggest_categorical('conv3_kernel_shape', [(3, 3), (5, 5), (7, 7)]),
             "padding1": trial.suggest_categorical('padding1', [0, 1, 2, 3]),
             "padding2": trial.suggest_categorical('padding2', [0, 1, 2, 3]),
             "padding3": trial.suggest_categorical('padding3', [0, 1, 2, 3]),
-            "conv1_activation": trial.suggest_categorical('conv1_activation', ['relu', 'elu', 'leaky_relu']),
-            "conv2_activation": trial.suggest_categorical('conv2_activation', ['relu', 'elu', 'leaky_relu']),
-            "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'elu', 'leaky_relu']),
-            "dense_nodes": trial.suggest_categorical('dense_nodes', [64, 128, 256]),
-            "dense_activation": trial.suggest_categorical('dense_activation', ['relu', 'elu']),
-            "depth": trial.suggest_categorical('depth', [train_data.shape[1]]),  # or set appropriately
-            "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 64, 128]),
-            "lstm2_cells": trial.suggest_categorical('lstm2_cells', [32, 64, 128]),
+            "conv1_activation": trial.suggest_categorical('conv1_activation', ['relu', 'elu', 'leaky_relu', 'gelu']),
+            "conv2_activation": trial.suggest_categorical('conv2_activation', ['relu', 'elu', 'leaky_relu', 'gelu']),
+            "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'elu', 'leaky_relu', 'gelu']),
+            "dense_nodes": trial.suggest_categorical('dense_nodes', [32, 64, 128, 256]),
+            "dense_activation": trial.suggest_categorical('dense_activation', ['relu', 'elu', 'leaky_relu', 'gelu']),
+            "depth": trial.suggest_categorical('depth', [train_data.shape[1]]),
+            "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 64, 128, 256]),
+            "lstm2_cells": trial.suggest_categorical('lstm2_cells', [32, 64, 128, 256]),
             "dense3_nodes": trial.suggest_categorical('dense3_nodes', [32, 64, 128, 256]),
-            "dense3_activation": trial.suggest_categorical('dense3_activation', ['relu', 'elu']),
+            "dense3_activation": trial.suggest_categorical('dense3_activation', ['relu', 'elu', 'leaky_relu', 'gelu']),
             "number_classes": len(np.unique(TASKS)),
-            "number_channels": train_data.shape[1],  # or set appropriately
+            "number_channels": train_data.shape[1],
             "mesh_rows": mesh_rows,
             "mesh_columns": mesh_columns,
             "split_size": split_size,
-            "learning_rate": trial.suggest_float('learning_rate', 5e-5, 5e-2, log=True),
+            "learning_rate": trial.suggest_float('learning_rate', 1e-5, 5e-3, log=True),
             "batch_size": trial.suggest_categorical('batch_size', [8, 16, 32, 64]),
-            "dropout_rate": trial.suggest_float('dropout_rate', 0.1, 0.7, step=0.1),
+            "dropout_rate": trial.suggest_float('dropout_rate', 0.05, 0.4, step=0.05),
+            "optimizer": trial.suggest_categorical('optimizer', ['adam', 'adamw', 'rmsprop']),
+            "weight_decay": trial.suggest_float('weight_decay', 1e-8, 1e-2, log=True),
+            "label_smoothing": trial.suggest_float('label_smoothing', 0.0, 0.2, step=0.05),
+            "transformer_nhead": trial.suggest_categorical('transformer_nhead', [2, 4, 8]),
+            "transformer_layers": trial.suggest_int('transformer_layers', 1, 2),
         }
     else:
         hyperparams = {
@@ -785,6 +783,23 @@ def get_hyperparameter_search_space(trial, train_data):
     }
         
     return hyperparams
+
+def get_training_parts(model, lr=1e-3, weight_decay=1e-4, max_epochs=100):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
+    
+    # Define your task names and desired weights
+    task_weights_dict = {
+        "resting": 0.5,
+        "math": 2.5,
+        "memory": 5.0,  # Give more weight to "memory"
+        "motor": 1.5
+    }
+    # Make sure TASKS is in the same order as your class indices
+    class_weights = torch.tensor([task_weights_dict[task] for task in TASKS], dtype=torch.float32).to(next(model.parameters()).device)
+    
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1, weight=class_weights)
+    return optimizer, scheduler, criterion
 
 
 def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, best_model_path=None,
@@ -825,6 +840,9 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
             print(np.bincount(train_df2['task_type'].astype('category').cat.codes))
             print("validation task types counts:")
             print(np.bincount(val_df2['task_type'].astype('category').cat.codes))
+
+            print("Train patient_id counts:\n", train_df2["patient_id"].value_counts())
+            print("Val patient_id counts:\n", val_df2["patient_id"].value_counts())
 
         model = ModelClass(**{k: v for k, v in hyperparams.items() if k in ModelClass.__init__.__code__.co_varnames}).to(device)
 

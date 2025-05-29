@@ -203,7 +203,7 @@ class MultiviewAttention(nn.Module):
         lstm2_cells,
         dense3_nodes,
         dense3_activation,
-        dropout_rate=0.5,
+        dropout_rate=0.3,  # Suggest lower default dropout
         number_classes=4,
         number_channels=248,
         mesh_rows=20,
@@ -239,7 +239,6 @@ class MultiviewAttention(nn.Module):
         # CNN branches for each window (up to flatten)
         self.cnn_branches = nn.ModuleList([
             nn.Sequential(
-                # Permute(0, 1, 2, 3),
                 nn.Conv2d(depth, conv1_filters, kernel_size=conv1_kernel_shape, padding=padding1),
                 nn.BatchNorm2d(conv1_filters),
                 act1,
@@ -248,12 +247,11 @@ class MultiviewAttention(nn.Module):
                 nn.Conv2d(conv1_filters, conv2_filters, kernel_size=conv2_kernel_shape, padding=padding2),
                 nn.BatchNorm2d(conv2_filters),
                 act2,
-                nn.Dropout(self.dropout_rate),
+                # Removed dropout here for less regularization
                 
                 nn.Conv2d(conv2_filters, conv3_filters, kernel_size=conv3_kernel_shape, padding=padding3),
                 nn.BatchNorm2d(conv3_filters),
                 act3,
-                nn.Dropout(self.dropout_rate),
                 nn.AdaptiveAvgPool2d((1, 1)),
                 nn.Flatten(start_dim=1)
             ) for _ in range(window_size)
@@ -291,10 +289,15 @@ class MultiviewAttention(nn.Module):
             nn.Linear(64, 1)
         )
 
-
         # LSTM layers
         self.lstm1 = nn.LSTM(dense_nodes, lstm1_cells, batch_first=True)
         self.lstm2 = nn.LSTM(lstm1_cells, lstm2_cells, batch_first=True)
+
+        # Transformer encoder block (NEW)
+        self.transformer_encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=dense_nodes, nhead=4, batch_first=True, dropout=self.dropout_rate),
+            num_layers=1
+        )
 
         # Dense after LSTM
         self.dense3 = nn.Linear(lstm2_cells, dense3_nodes)
@@ -302,11 +305,10 @@ class MultiviewAttention(nn.Module):
 
         # Final layers
         self.final_add = nn.Linear(dense_nodes, dense_nodes)  # for addition, if needed
-        self.final_out = nn.Linear(dense3_nodes + dense_nodes + dense_nodes, number_classes)
+        # +dense_nodes for transformer output
+        self.final_out = nn.Linear(dense3_nodes + dense_nodes + dense_nodes + dense_nodes, number_classes)
 
     def forward(self, x_cnn_list, x_lstm_list):
-        # x_cnn_list: list of [batch, depth, mesh_rows, mesh_columns]
-        # x_lstm_list: list of [batch, number_channels, depth]
         cnn_outs = []
         for i, (branch, dense) in enumerate(zip(self.cnn_branches, self.cnn_dense)):
             out = branch(x_cnn_list[i])
@@ -315,30 +317,30 @@ class MultiviewAttention(nn.Module):
         
         lstm_in = []
         for branch, x_lstm in zip(self.lstm_dense, x_lstm_list):
-            # x_lstm: (batch, split_size, depth)
             out = branch(x_lstm)  # (batch, split_size, dense_nodes)
-            # out = out.max(dim=1).values # (batch, dense_nodes)
-            # Attention pooling
             attn_weights = self.lstm_temporal_attention(out).squeeze(-1)  # (batch, split_size)
             attn_weights = F.softmax(attn_weights, dim=1).unsqueeze(-1)   # (batch, split_size, 1)
             out = (out * attn_weights).sum(dim=1)  # Weighted sum: (batch, dense_nodes)
-            
             lstm_in.append(out)
         lstm_in = torch.stack(lstm_in, dim=1)  # (batch, window_size, dense_nodes)
         
-        # Apply self-attention across windows
+        # Self-attention across windows
         attn_output, _ = self.attention(lstm_in, lstm_in, lstm_in)
-        attn_feat = self.dropout(attn_output.mean(dim=1))  # Dropout added here
+        attn_feat = self.dropout(attn_output.mean(dim=1))
 
+        # Transformer encoder (NEW)
+        transformer_out = self.transformer_encoder(lstm_in)
+        transformer_feat = self.dropout(transformer_out.mean(dim=1))
 
+        # LSTM
         lstm_out, _ = self.lstm1(lstm_in)
         lstm_out, _ = self.lstm2(lstm_out)
         lstm_feat = self.dense3_act(self.dense3(lstm_out[:, -1, :]))
-        lstm_feat = self.dropout(lstm_feat)  # Dropout after activation
+        lstm_feat = self.dropout(lstm_feat)
 
         added = self.dropout(torch.stack(cnn_outs, dim=0).sum(dim=0))
-        final = torch.cat([lstm_feat, added, attn_feat], dim=-1)
-        final = self.dropout(final)  # Optional: before final classifier
+        final = torch.cat([lstm_feat, added, attn_feat, transformer_feat], dim=-1)
+        final = self.dropout(final)
 
         out = self.final_out(final)
         return out
