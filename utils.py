@@ -34,7 +34,7 @@ import zipfile
 import random
 import optuna
 import json
-from Model import MEGClassifier, MultiviewAttention, MultiviewDataset
+from Model import MEGClassifier, MultiviewAttention, MultiviewDataset, MultiviewAttentionRef
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.model_selection import StratifiedKFold
 import matplotlib.pyplot as plt
@@ -42,11 +42,11 @@ from sklearn.model_selection import GroupKFold
 
 
 # Gloval variables
-debug_mode = True  # controls whether to print debug information
+debug_mode = False  # controls whether to print debug information
 TASKS = ["resting", "math", "memory", "motor"]
 METRICS = ["accuracy", "F1", "recall", "precision"]
 # selced model to train
-ModelClass = MultiviewAttention  # or MEGClassifier, etc.
+ModelClass = MultiviewAttentionRef # MultiviewAttention  # or MEGClassifier, etc.
 
 # functions
 def get_dataset_from_h5py(filename_path):
@@ -344,7 +344,7 @@ def create_metrics_df():
         used_hyperparameters = list(hyperparams.keys())
     except Exception as e:
         # fallback: use static list if dummy fails
-        if ModelClass == MultiviewAttention:
+        if ModelClass in [MultiviewAttention, MultiviewAttentionRef]:
             used_hyperparameters = [
                 "window_size", "conv1_filters", "conv2_filters", "conv3_filters",
                 "conv1_kernel_shape", "conv2_kernel_shape", "conv3_kernel_shape",
@@ -404,71 +404,150 @@ def create_metrics_df():
 
 
 def train_full_model(
-    model, train_loader, epochs, lr, patience, device, hyperparams, save_path=None
+    study,
+    train_data,
+    train_df,
+    utils,
+    device,
+    epochs=100,
+    verbose=True,
+    path="full_training_curves.png"
 ):
     """
-    Train the model on the full training dataset for a specified number of epochs.  
-    
-    Parameters:
-        model (torch.nn.Module): The model to train.
-        train_loader (DataLoader): DataLoader for the training data.
-        epochs (int): Number of epochs to train the model.
-        lr (float): Learning rate for the optimizer.
-        patience (int): Number of epochs with no improvement after which training will be stopped.
-        device (torch.device): Device to run the training on (CPU or GPU).
-        hyperparams (dict): Hyperparameters for the model.
-        save_path (str, optional): Path to save the trained model. If None, model won't be saved.
+    Trains the best model found by Optuna on the full training set and plots training curves.
+
+    Args:
+        study: Optuna study object after optimization.
+        train_data: Training data (numpy array or tensor).
+        train_df: Training DataFrame with labels.
+        utils: Module with ModelClass, dataloader, and training utilities.
+        device: Torch device.
+        epochs: Number of epochs to train.
+        verbose: Print progress if True.
+
     Returns:
-        model (torch.nn.Module): The trained model.
+        best_model: Trained model.
+        best_params: Parameters used.
+        (fig, (ax1, ax2)): Matplotlib figure and axes for the training curves.
+        train_accs, train_f1s, train_losses: Lists of metrics per epoch.
     """
 
-    optimizer_name = hyperparams.get("optimizer", "adam")
-    weight_decay = hyperparams.get("weight_decay", 1e-4)
-    label_smoothing = hyperparams.get("label_smoothing", 0.1)
+    best_trial = study.best_trial
+    best_params = best_trial.params.copy()
+    best_params["number_channels"] = train_data.shape[1]
+    best_params["depth"] = train_data.shape[1]
+    best_params["number_classes"] = len(np.unique(train_df['task_type']))
+    best_params["num_classes"] = len(np.unique(train_df['task_type']))
 
-    optimizer, scheduler, criterion = get_training_parts(model, lr=lr, max_epochs=epochs,
-                                                         optimizer_name=optimizer_name,
-                                                         weight_decay=weight_decay,
-                                                         label_smoothing=label_smoothing)
+    # Recompute split_size and mesh_columns if missing
+    if "split_size" not in best_params:
+        T = train_data.shape[2]
+        best_params["split_size"] = T // best_params["window_size"] 
+
+    if "mesh_rows" not in best_params and "mesh_rows_index" in best_params:
+        mesh_row_candidates = [r for r in range(5, min(50, best_params["split_size"] + 1)) if best_params["split_size"] % r == 0]
+        best_params["mesh_rows"] = mesh_row_candidates[best_params["mesh_rows_index"]]
+
+    if "mesh_columns" not in best_params:
+        best_params["mesh_columns"] = best_params["split_size"] // best_params["mesh_rows"]
+
+    # Instantiate model
+    best_model = utils.ModelClass(**{k: v for k, v in best_params.items() if k in utils.ModelClass.__init__.__code__.co_varnames}).to(device)
+
+    # Dataloader
+    if utils.ModelClass.__name__ in ["MultiviewAttention", "MultiviewAttentionRef"]:
+        train_loader = utils.get_multiview_dataloader(
+            train_data, train_df,
+            batch_size=best_params["batch_size"],
+            window_size=best_params["window_size"],
+            mesh_rows=best_params["mesh_rows"],
+            mesh_columns=best_params["mesh_columns"],
+            depth=best_params["depth"],
+            shuffle=True
+        )
+    else:
+        train_loader, train_X, train_y = utils.get_dataloader(
+            data_tensor=train_data, df=train_df,
+            batch_size=best_params["batch_size"],
+            input_time_length=best_params.get("input_time_length", 256),
+            stride=best_params.get("stride", 256),
+            shuffle=True
+        )
+
+    train_accs, train_f1s, train_losses = [], [], []
+
+    optimizer_name = best_params.get("optimizer", "adam")
+    weight_decay = best_params.get("weight_decay", 1e-4)
+    learning_rate = best_params.get("learning_rate", 0.001)
+    label_smoothing = best_params.get("label_smoothing", 0.1)
+
+    optimizer, scheduler, criterion = utils.get_training_parts(
+        best_model, lr=learning_rate, max_epochs=epochs,
+        optimizer_name=optimizer_name,
+        weight_decay=weight_decay,
+        label_smoothing=label_smoothing
+    )
 
     for epoch in range(epochs):
-        single_train_epoch(model, train_loader, optimizer, criterion, device)
+        train_preds, train_targets, train_loss = utils.single_train_epoch(
+            model=best_model, 
+            train_loader=train_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device
+        )
+        train_metrics = best_model.evaluate(y_true=train_targets, y_pred=train_preds)
+        train_accs.append(train_metrics["overall_accuracy"])
+        train_f1s.append(train_metrics["overall_F1"])
+        train_losses.append(train_loss)
+        scheduler.step()
+        if verbose and (epoch % 10 == 0 or epoch == epochs-1):
+            print(f"Epoch {epoch+1}/{epochs} - Acc: {train_accs[-1]:.4f} - F1: {train_f1s[-1]:.4f} - Loss: {train_losses[-1]:.4f}")
 
-    # Save final model
-    if save_path:
-        torch.save(model.state_dict(), save_path)
-    return model
+    total_train_acc = np.mean(train_accs)
+    print(f"Total Train Accuracy: {total_train_acc:.4f}")
+
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+    ax1.plot(train_accs, label="Train Accuracy", color='tab:blue')
+    ax1.plot(train_f1s, label="Train F1", linestyle="--", color='tab:green')
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Accuracy / F1")
+    ax1.tick_params(axis='y')
+    ax1.legend(loc='upper left')
+
+    ax2 = ax1.twinx()
+    ax2.plot(train_losses, label="Train Loss", linestyle=":", color='tab:purple')
+    ax2.set_ylabel("Loss")
+    ax2.tick_params(axis='y')
+    ax2.legend(loc='upper right')
+
+    plt.title(f"Full Training Accuracy, F1 & Loss ({utils.ModelClass.__name__}) Total Train Acc: {total_train_acc:.4f}")
+    plt.grid(True)
+    plt.savefig(path, bbox_inches='tight')
+    plt.show()
+
+    return best_model, best_params, (fig, (ax1, ax2)), train_accs, train_f1s, train_losses
 
 def single_train_epoch(model, train_loader, optimizer, criterion, device):
-    """
-    Train the model for one epoch on the training data.
-    
-    Parameters:
-        model (torch.nn.Module): The model to train.
-        train_loader (DataLoader): DataLoader for the training data.
-        optimizer (torch.optim.Optimizer): Optimizer for updating model parameters.
-        criterion (torch.nn.Module): Loss function to compute the loss.
-        device (torch.device): Device to run the training on (CPU or GPU).
-    
-    Returns:
-        train_preds (np.ndarray): Predictions on the training data.
-        train_targets (np.ndarray): True labels for the training data.
-        train_loss (float): Average loss over the training epoch.
-    """ 
     model.train()
     train_preds, train_targets = [], []
     train_loss = 0.0
     for batch in train_loader:
         if isinstance(model, MultiviewAttention):
-            if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                x_cnn_list, x_lstm_list, y_batch = batch
-                x_cnn_list = [x.to(device) for x in x_cnn_list]
-                x_lstm_list = [x.to(device) for x in x_lstm_list]
-            else:
-                raise ValueError("Expected batch to be (x_cnn_list, x_lstm_list, y_batch) for MultiviewAttention.")
+            # expects both x_cnn_list and x_lstm_list
+            x_cnn_list, x_lstm_list, y_batch = batch
+            x_cnn_list = [x.to(device) for x in x_cnn_list]
+            x_lstm_list = [x.to(device) for x in x_lstm_list]
             y_batch = y_batch.to(device)
             optimizer.zero_grad()
             outputs = model(x_cnn_list, x_lstm_list)
+        elif isinstance(model, MultiviewAttentionRef):
+            # expects only x_cnn_list
+            x_cnn_list, x_lstm_list, y_batch = batch
+            x_cnn_list = [x.to(device) for x in x_cnn_list]
+            y_batch = y_batch.to(device)
+            optimizer.zero_grad()
+            outputs = model(x_cnn_list)
         else:
             x_batch, y_batch = batch
             x_batch = x_batch.to(device)
@@ -484,24 +563,12 @@ def single_train_epoch(model, train_loader, optimizer, criterion, device):
     train_loss /= len(train_loader.dataset)
     train_preds = np.array(train_preds)
     train_targets = np.array(train_targets)
-
     return train_preds, train_targets, train_loss
 
 
 def single_eval_epoch(model, val_loader, criterion, device):
-
     """
     Evaluate the model for one epoch on the validation or test data.
-    
-    Parameters:
-        model (torch.nn.Module): The model to evaluate.
-        val_loader (DataLoader): DataLoader for the evaluation data.
-        criterion (torch.nn.Module): Loss function to compute the loss.
-        device (torch.device): Device to run the evaluation on (CPU or GPU).
-    
-    Returns:
-        eval_preds (np.ndarray): Predictions on the evaluation data.
-        eval_targets (np.ndarray): True labels for the evaluation data.
     """
     model.eval()
     val_preds, val_targets = [], []
@@ -509,14 +576,18 @@ def single_eval_epoch(model, val_loader, criterion, device):
     with torch.no_grad():
         for batch in val_loader:
             if isinstance(model, MultiviewAttention):
-                if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                    x_cnn_list, x_lstm_list, y_batch = batch
-                    x_cnn_list = [x.to(device) for x in x_cnn_list]
-                    x_lstm_list = [x.to(device) for x in x_lstm_list]
-                else:
-                    raise ValueError("Expected batch to be (x_cnn_list, x_lstm_list, y_batch) for MultiviewAttention.")
+                # expects both x_cnn_list and x_lstm_list
+                x_cnn_list, x_lstm_list, y_batch = batch
+                x_cnn_list = [x.to(device) for x in x_cnn_list]
+                x_lstm_list = [x.to(device) for x in x_lstm_list]
                 y_batch = y_batch.to(device)
                 outputs = model(x_cnn_list, x_lstm_list)
+            elif isinstance(model, MultiviewAttentionRef):
+                # expects only x_cnn_list
+                x_cnn_list, x_lstm_list, y_batch = batch
+                x_cnn_list = [x.to(device) for x in x_cnn_list]
+                y_batch = y_batch.to(device)
+                outputs = model(x_cnn_list)
             else:
                 x_batch, y_batch = batch
                 x_batch = x_batch.to(device)
@@ -529,7 +600,6 @@ def single_eval_epoch(model, val_loader, criterion, device):
     val_loss /= len(val_loader.dataset)
     val_preds = np.array(val_preds)
     val_targets = np.array(val_targets)
-
     return val_preds, val_targets, val_loss
 
 def multiview_collate_fn(batch):
@@ -771,7 +841,37 @@ def get_hyperparameter_search_space(trial, train_data):
     Returns:
         dict: A dictionary containing the hyperparameter search space.
     """
-    if ModelClass == MultiviewAttention:
+    if ModelClass == MultiviewAttentionRef:
+        window_size = trial.suggest_categorical('window_size', [4, 8])
+        T = train_data.shape[2]
+        split_size = T // window_size
+
+        mesh_row_candidates = [r for r in range(5, min(50, split_size + 1)) if split_size % r == 0]
+        if not mesh_row_candidates:
+            raise optuna.TrialPruned(f"No valid mesh_rows for split_size={split_size}")
+
+        mesh_rows = mesh_row_candidates[trial.suggest_int('mesh_rows_index', 0, len(mesh_row_candidates) - 1)]
+        mesh_columns = split_size // mesh_rows
+
+        hyperparams = {
+            "window_size": window_size,
+            "cnn_filters": trial.suggest_categorical('cnn_filters', [32, 64, 128]),
+            "lstm_hidden": trial.suggest_categorical('lstm_hidden', [32, 64, 128]),
+            "dense_hidden": trial.suggest_categorical('dense_hidden', [32, 64, 128]),
+            "num_classes": len(np.unique(TASKS)),
+            "depth": train_data.shape[1],
+            "mesh_rows": mesh_rows,
+            "mesh_columns": mesh_columns,
+            "split_size": split_size,
+            "learning_rate": trial.suggest_float('learning_rate', 1e-4, 2e-3, log=True),
+            "batch_size": trial.suggest_categorical('batch_size', [4, 8, 16]),
+            "dropout_rate": trial.suggest_float('dropout_rate', 0.05, 0.2, step=0.05),
+            "optimizer": trial.suggest_categorical('optimizer', ['adam', 'adamw']),
+            "weight_decay": trial.suggest_float('weight_decay', 1e-8, 1e-3, log=True),
+            "label_smoothing": trial.suggest_float('label_smoothing', 0.0, 0.2, step=0.05),
+        }    
+    
+    elif ModelClass in [MultiviewAttention]:
         window_size = trial.suggest_categorical('window_size', [4, 8])
         T = train_data.shape[2]
         split_size = T // window_size
@@ -927,7 +1027,7 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
     val_accs = []
 
     for fold_idx in range(n_splits):
-        if ModelClass == MultiviewAttention:
+        if ModelClass in [MultiviewAttention, MultiviewAttentionRef]:
             train_loader, val_loader, train_df2, val_df2 = get_multiview_dataloaders(
                 train_data, train_df,
                 fold_index=fold_idx,
@@ -965,7 +1065,7 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
         best_val_acc, updated_metrics_df, train_accs, val_accs_fold, train_losses, val_losses = train_model(
             model, train_loader, val_loader,
             attempt_index=trial_index,
-            epochs=50,
+            epochs=200,
             lr=hyperparams["learning_rate"],
             patience=10,
             device=device,
@@ -1015,7 +1115,7 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
 
 def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64, input_time_length=256, stride=128, path=None):
     model.eval()
-    if isinstance(model, MultiviewAttention):
+    if isinstance(model, (MultiviewAttention, MultiviewAttentionRef)):
         test_loader = get_multiview_dataloader(
             test_data, test_df, batch_size=batch_size,
             window_size=model.window_size,
@@ -1043,3 +1143,227 @@ def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64, 
     if path:
         df_test_result.to_csv(path, index=False)
     return test_metrics, df_test_result
+
+
+def plot_per_patient_accuracy_bars(
+    df_test_result,
+    output_dir,
+    which_dataset,
+    model_name,
+    timestamp,
+    task_names=TASKS,
+    style="dark_background"
+):
+    """
+    Plots and saves per-patient and overall accuracy per task as grouped bar plots.
+
+    Args:
+        df_test_result (pd.DataFrame): DataFrame with columns 'y_true', 'y_pred', 'patient_id'.
+        output_dir (str): Output directory for saving the plot.
+        which_dataset (str): Dataset name for path.
+        model_name (str): Model name for path.
+        timestamp (str): Timestamp for path.
+        task_names (list, optional): List of task names. If None, will use sorted unique values from df_test_result.
+        style (str): Matplotlib style to use.
+    """
+    plt.style.use(style)
+
+    if task_names is None:
+        task_names = [str(t) for t in sorted(df_test_result['y_true'].unique())]
+
+    # Compute overall accuracy per task
+    overall_acc_per_task = df_test_result.groupby('y_true').apply(lambda x: (x['y_true'] == x['y_pred']).mean())
+    per_patient_acc = df_test_result.groupby(['patient_id', 'y_true']).apply(lambda x: (x['y_true'] == x['y_pred']).mean()).unstack(0)
+    overall_acc = (df_test_result['y_true'] == df_test_result['y_pred']).mean()
+
+    tasks = sorted(df_test_result['y_true'].unique())
+    patients = per_patient_acc.columns.tolist()
+    n_tasks = len(tasks)
+    n_bars = len(patients) + 1  # patients + overall
+
+    fig, axs = plt.subplots(1, n_tasks, figsize=(5*n_tasks, 7), sharey=True)
+
+    bar_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
+    overall_color = '#ffffff'
+    task_title_colors = ['#00bfff', '#ff69b4', '#ffd700', '#00fa9a']  # blue, pink, gold, green
+
+    for t_idx, t in enumerate(tasks):
+        ax = axs[t_idx]
+        # Per-patient bars
+        for i, patient in enumerate(patients):
+            acc = per_patient_acc[patient].reindex(tasks, fill_value=0)[t]
+            bar = ax.bar(i, acc, color=bar_colors[i % len(bar_colors)], width=0.7, label=f'Patient {patient}' if t_idx == 0 else "", zorder=3)
+            label = str(int(acc)) if np.isclose(acc, 1.0) else f"{acc:.2f}"
+            ax.text(i, acc + 0.025, label, ha='center', va='bottom', fontsize=16, color='white', fontweight='bold')
+        # Overall bar
+        overall = overall_acc_per_task.reindex(tasks, fill_value=0)[t]
+        bar = ax.bar(len(patients), overall, color=overall_color, edgecolor='black', width=0.7, label='Overall' if t_idx == 0 else "", zorder=3)
+        label = str(int(overall)) if np.isclose(overall, 1.0) else f"{overall:.2f}"
+        ax.text(len(patients), overall + 0.025, label, ha='center', va='bottom', fontsize=16, color='white', fontweight='bold')
+        # Formatting
+        ax.set_title(task_names[t], fontsize=28, fontweight='bold', color=task_title_colors[t_idx % len(task_title_colors)])
+        ax.set_xticks(list(range(n_bars)))
+        ax.set_xticklabels([f"P{p}" for p in patients] + ["Overall"], fontsize=18, fontweight='bold', rotation=30)
+        ax.set_ylim(0, 1.18)
+        ax.grid(axis='y', linestyle=':', alpha=0.5, zorder=0)
+        ax.tick_params(axis='y', labelsize=18)
+        if t_idx == 0:
+            ax.set_ylabel('Accuracy', fontsize=28, fontweight='bold', color='white')
+
+        if t_idx == n_tasks-1:
+            ax.legend(fontsize=16, loc='upper left', bbox_to_anchor=(1.05, 1.0))
+
+    fig.supxlabel('Patients', fontsize=28, fontweight='bold', color='white')
+    fig.suptitle(f'Per-patient and Overall Accuracy per Task - Overall Accuracy: {overall_acc:.3f}', fontsize=30, fontweight='bold', color='skyblue')
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    path = f"{output_dir}/{which_dataset}/per_patient_accuracy_{model_name}_{timestamp}.png"
+    plt.savefig(path, bbox_inches='tight')
+    plt.show()
+    return fig, axs, path, per_patient_acc, overall_acc_per_task
+
+
+def plot_per_patient_accuracy_heatmap(
+    per_patient_acc,
+    overall_acc_per_task,
+    df_test_result,
+    output_dir,
+    which_dataset,
+    model_name,
+    timestamp,
+    task_names=TASKS,
+    title="Per-patient Accuracy per Task Heatmap"
+):
+    """
+    Plots and saves a heatmap of per-patient accuracy per task, including an overall row.
+
+    Parameters:
+        per_patient_acc (pd.DataFrame): DataFrame indexed by patient and task with accuracy values.
+        overall_acc_per_task (pd.Series): Series indexed by task with overall accuracy per task.
+        df_test_result (pd.DataFrame): DataFrame with 'y_true' column for task indices.
+        output_dir (str): Output directory for saving the plot.
+        which_dataset (str): Dataset name for path.
+        model_name (str): Model name for path.
+        timestamp (str): Timestamp for path.
+        task_names (list, optional): List of task names. If None, will use sorted unique values from df_test_result.
+        title (str): Plot title.
+    """
+    plt.style.use('default')
+
+    if task_names is None:
+        task_names = [str(t) for t in sorted(df_test_result['y_true'].unique())]
+    tasks = sorted(df_test_result['y_true'].unique())
+    patients = per_patient_acc.columns.tolist()
+    heatmap_data = per_patient_acc.reindex(index=tasks, columns=patients, fill_value=np.nan).T.values  # (n_patients, n_tasks)
+    overall_per_task = overall_acc_per_task.reindex(tasks, fill_value=np.nan).values  # (n_tasks,)
+
+    # Add overall_per_task as a new row at the end
+    heatmap_data_with_overall = np.vstack([heatmap_data, overall_per_task[None, :]])
+    yticklabels = [str(p) for p in patients] + [r"$\bf{Overall}$"]  # bold and pretty overall label
+
+    fig, ax = plt.subplots(figsize=(10, max(6, len(yticklabels)*0.5)))
+
+    im = ax.imshow(heatmap_data_with_overall, cmap='Blues', vmin=0, vmax=1)
+
+    # Show all ticks and label them
+    ax.set_xticks(np.arange(len(tasks)))
+    ax.set_yticks(np.arange(len(yticklabels)))
+    ax.set_xticklabels([task_names[t] for t in tasks], fontsize=11, fontweight='bold')
+    ax.set_yticklabels(yticklabels, fontsize=11, fontweight='bold')
+
+    plt.setp(ax.get_xticklabels(), rotation=20, ha="right", rotation_mode="anchor")
+
+    # Color only the last yticklabel ("Overall") in deepskyblue
+    for tick in ax.get_yticklabels():
+        tick.set_color("black")
+    ax.get_yticklabels()[-1].set_color("deepskyblue")
+
+    # Loop over data dimensions and create text annotations.
+    for i in range(len(yticklabels)):
+        for j in range(len(tasks)):
+            val = heatmap_data_with_overall[i, j]
+            if not np.isnan(val):
+                label = str(int(val)) if np.isclose(val, 1.0) else f"{val:.2f}"
+                # Make "Overall" row text bold and deepskyblue, others normal black
+                if i == len(yticklabels)-1:
+                    color = "deepskyblue"
+                    weight = 'bold'
+                else:
+                    color = "black"
+                    weight = 'normal'
+                ax.text(j, i, label, ha="center", va="center", color=color, fontsize=9, fontweight=weight)
+
+    ax.set_xlabel("Task", fontsize=14, fontweight='bold', color="darkblue")
+    ax.set_ylabel("Patient", fontsize=14, fontweight='bold', color="darkblue")
+    ax.set_title(title, color="darkblue", fontsize=15, fontweight='bold')
+    # Make colorbar shorter (smaller height)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.04)
+    cbar.set_label('Accuracy', fontsize=12, fontweight="bold", color="darkred")
+    plt.tight_layout()
+    path = f"{output_dir}/{which_dataset}/per_patient_accuracy_heatmap_{model_name}_{timestamp}.png"
+    plt.savefig(path, bbox_inches='tight')
+    plt.show()
+    return fig, ax, path
+
+
+def evaluate_and_log_testset(
+    study,
+    best_model,
+    best_params,
+    test_data,
+    test_df,
+    device,
+    all_metrics_df,
+    model_csv_path,
+    output_dir,
+    which_dataset,
+    model_name,
+    timestamp,
+    path=None
+):
+    """
+    Evaluates the best model on the test set, updates metrics DataFrame, and saves results.
+
+    Returns:
+        test_metrics: dict of test metrics
+        df_test_result: DataFrame with test results
+        all_metrics_df: updated metrics DataFrame
+    """
+    if path is None:
+        test_csv_path = f"{output_dir}/{which_dataset}/test_metrics_{model_name}_{timestamp}.csv"
+    else:
+        test_csv_path = path
+
+    best_trial = study.best_trial
+
+    test_metrics, df_test_result = evaluate_model_on_testset(
+        best_model, test_data, test_df, device,
+        batch_size=best_params.get("batch_size", 64),
+        input_time_length=best_params.get("input_time_length", 256),
+        stride=best_params.get("stride", 256),
+        path=test_csv_path
+    )
+
+    print("Test metrics:", test_metrics, "\nBest trial ID:", best_trial.number + 1, '\n')
+
+    # Add "test_" prefix to all columns in test_metrics
+    test_metrics_prefixed = {f"test_{k}": v for k, v in test_metrics.items()}
+
+    # Find the row for the best trial (trial_id matches best_trial.number + 1)
+    row_idx = all_metrics_df[all_metrics_df["trial_id"] == best_trial.number + 1].index
+    if len(row_idx) == 0:
+        # fallback: use last row
+        row_idx = [all_metrics_df.index[-1]]
+    row_idx = row_idx[0]
+
+    # Copy all columns in test_metrics_prefixed to the DataFrame row
+    for col, value in test_metrics_prefixed.items():
+        if col in all_metrics_df.columns:
+            all_metrics_df.at[row_idx, col] = value
+
+    # Save metrics
+    all_metrics_df.to_csv(model_csv_path, index=False)
+    print(f"All metrics saved to {model_csv_path}")
+    print("Best hyperparameters:", best_params)
+    print("Best validation accuracy:", study.best_value)
+
+    return test_metrics, df_test_result, all_metrics_df

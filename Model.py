@@ -453,4 +453,99 @@ class EEGNet(nn.Module):
         x = self.classifier(x)
         return x
 
-   
+
+class SimpleAttention(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.attn = nn.Linear(input_dim, 1)
+
+    def forward(self, x):
+        # x: (batch, seq_len, input_dim)
+        weights = F.softmax(self.attn(x), dim=1)  # (batch, seq_len, 1)
+        return (x * weights).sum(dim=1)  # (batch, input_dim)
+
+class MultiviewAttentionRef(nn.Module):
+    def __init__(self, window_size, depth, mesh_rows, mesh_columns, cnn_filters, lstm_hidden, dense_hidden, num_classes):
+        super().__init__()
+        self.window_size = window_size
+        self.depth = depth
+        self.mesh_rows = mesh_rows
+        self.mesh_columns = mesh_columns
+        self.cnn_filters = cnn_filters
+        self.lstm_hidden = lstm_hidden
+        self.dense_hidden = dense_hidden
+        self.num_classes = num_classes
+        
+        self.cnn_branches = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(depth, cnn_filters, kernel_size=3, padding=1),
+                nn.BatchNorm2d(cnn_filters),
+                nn.ELU(),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten()
+            ) for _ in range(window_size)
+        ])
+        self.dense_branches = nn.ModuleList([
+            nn.Linear(cnn_filters, dense_hidden) for _ in range(window_size)
+        ])
+        self.lstm_branches = nn.ModuleList([
+            nn.LSTM(dense_hidden, lstm_hidden, batch_first=True) for _ in range(window_size)
+        ])
+        self.attn_branches = nn.ModuleList([
+            SimpleAttention(lstm_hidden) for _ in range(window_size)
+        ])
+        self.final_dense = nn.Sequential(
+            nn.Linear(window_size * lstm_hidden, 64),
+            nn.ELU(),
+            nn.Linear(64, num_classes)
+        )
+
+    def forward(self, x_cnn_list):
+        window_features = []
+        for i in range(self.window_size):
+            # Ensure each window is reshaped to (batch, depth, mesh_rows, mesh_columns)
+            x = x_cnn_list[i].reshape(-1, self.depth, self.mesh_rows, self.mesh_columns)
+            x = self.cnn_branches[i](x)  # (batch, cnn_filters)
+            x = self.dense_branches[i](x).unsqueeze(1)  # (batch, 1, dense_hidden)
+            lstm_out, _ = self.lstm_branches[i](x)  # (batch, 1, lstm_hidden)
+            attn_out = self.attn_branches[i](lstm_out)  # (batch, lstm_hidden)
+            window_features.append(attn_out)
+        features = torch.cat(window_features, dim=1)  # (batch, window_size * lstm_hidden)
+        return self.final_dense(features)
+    
+    def predict(self, loader, device):
+        self.eval()
+        preds = []
+        with torch.no_grad():
+            for batch in loader:
+                batch_x_cnn, batch_x_lstm, _ = batch  # unpack all, but only use batch_x_cnn
+                batch_x_cnn = [x.to(device) for x in batch_x_cnn]
+                outputs = self.forward(batch_x_cnn)  # Only pass batch_x_cnn!
+                batch_preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                preds.extend(batch_preds)
+        return np.array(preds)
+
+    def evaluate(self, y_pred, y_true):
+        if isinstance(y_true, torch.Tensor):
+            y_true = y_true.cpu().numpy()
+        if isinstance(y_pred, torch.Tensor):
+            y_pred = y_pred.cpu().numpy()
+        results = {}
+        results["overall_accuracy"] = accuracy_score(y_true, y_pred)
+        results["overall_F1"] = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        results["overall_recall"] = recall_score(y_true, y_pred, average='macro', zero_division=0)
+        results["overall_precision"] = precision_score(y_true, y_pred, average='macro', zero_division=0)
+        if hasattr(self, "tasks") and self.tasks is not None and len(self.tasks) > 1:
+            for idx, task in enumerate(self.tasks):
+                mask = (y_true == idx)
+                if np.sum(mask) == 0:
+                    results[f"{task}_accuracy"] = np.nan
+                    results[f"{task}_F1"] = np.nan
+                    results[f"{task}_recall"] = np.nan
+                    results[f"{task}_precision"] = np.nan
+                else:
+                    results[f"{task}_accuracy"] = accuracy_score(y_true[mask], y_pred[mask])
+                    results[f"{task}_F1"] = f1_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
+                    results[f"{task}_recall"] = recall_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
+                    results[f"{task}_precision"] = precision_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
+        return results
