@@ -42,7 +42,7 @@ from sklearn.model_selection import GroupKFold
 
 
 # Gloval variables
-debug_mode = False  # controls whether to print debug information
+debug_mode = True  # controls whether to print debug information
 TASKS = ["resting", "math", "memory", "motor"]
 METRICS = ["accuracy", "F1", "recall", "precision"]
 # selced model to train
@@ -80,6 +80,62 @@ def get_dataset_from_h5py(filename_path):
         print(f"An error occurred: {e}")
 
     return matrix
+
+def load_dataset(which_dataset="intra", data_dir="./Data", scaler_type="Z_SCORE_LOCAL", downsample_rate=0):
+    ## load the chosen dataset/s
+    train_data, train_df = None, None
+    test_data, test_df = None, None
+
+    print(f"Loading {which_dataset} dataset...")
+    if which_dataset == "intra":
+        # INTRA TRAIN
+        intra_train_data_scaled, intra_train_df = try_load_scaled("intra_train", scaler_type)
+        if intra_train_data_scaled is None:
+            intra_train_folder = os.path.join(data_dir, "Intra", "train")
+            intra_train_data, intra_train_df = load_eeg_data_and_metadata(intra_train_folder, split="train")
+            intra_train_data_scaled, intra_train_df = scale_and_cache(
+                intra_train_data, intra_train_df, "intra_train", scaler_type, downsample_factor=downsample_rate)
+
+        # INTRA TEST
+        intra_test_data_scaled, intra_test_df = try_load_scaled("intra_test", scaler_type)
+        if intra_test_data_scaled is None:
+            intra_test_folder = os.path.join(data_dir, "Intra", "test")
+            intra_test_data, intra_test_df = load_eeg_data_and_metadata(intra_test_folder, split="test")
+            intra_test_data_scaled, intra_test_df = scale_and_cache(
+                intra_test_data, intra_test_df, "intra_test", scaler_type, downsample_factor=downsample_rate)
+        
+        train_data, train_df = intra_train_data_scaled, intra_train_df
+        test_data, test_df = intra_test_data_scaled, intra_test_df
+    if which_dataset == "cross":
+        # CROSS TRAIN
+        cross_train_data_scaled, cross_train_df = try_load_scaled("cross_train", scaler_type)
+        if cross_train_data_scaled is None:
+            cross_train_folder = os.path.join(data_dir, "Cross", "train")
+            cross_train_data, cross_train_df = load_eeg_data_and_metadata(cross_train_folder, split="train")
+            cross_train_data_scaled, cross_train_df = scale_and_cache(
+                cross_train_data, cross_train_df, "cross_train", scaler_type, downsample_factor=downsample_rate)
+
+        # CROSS TEST (list of datasets)
+        cross_test_data_scaled = []
+        cross_test_df_list = []
+        for i in range(1, 4):
+            prefix = f"cross_test{i}"
+            scaled, meta = try_load_scaled(prefix, scaler_type)
+            if scaled is None:
+                folder = os.path.join(data_dir, "Cross", f"test{i}")
+                data, df = load_eeg_data_and_metadata(folder, split=f"test{i}")
+                scaled, meta = scale_and_cache(data, df, prefix, scaler_type, downsample_factor=downsample_rate)
+            cross_test_data_scaled.append(scaled)
+            cross_test_df_list.append(meta)
+        
+        cross_test_df_merged = pd.concat(cross_test_df_list, ignore_index=True)
+        cross_test_data_merged = torch.cat(cross_test_data_scaled, dim=0)
+
+        train_data, train_df = cross_train_data_scaled, cross_train_df
+        test_data, test_df = cross_test_data_merged, cross_test_df_merged
+
+    print(f"Data for dataset {which_dataset} was loaded successfully")
+    return train_data, train_df, test_data, test_df
 
 def load_eeg_data_and_metadata(folder_path, split):
     import glob
@@ -270,68 +326,44 @@ def create_metrics_df():
     """
     Create a DataFrame to log training metrics.
     """
-
-    # Define the metrics and tasks
     metrics = ["accuracy", "F1", "recall", "precision"]
     tasks = ["overall", "resting", "math", "memory", "motor"]
-    # For MultiviewAttention
-    hyperparameters = [
-        "window_size",
-        "conv1_filters",
-        "conv2_filters",
-        "conv3_filters",
-        "conv1_kernel_shape",
-        "conv2_kernel_shape",
-        "conv3_kernel_shape",
-        "padding1",
-        "padding2",
-        "padding3",
-        "conv1_activation",
-        "conv2_activation",
-        "conv3_activation",
-        "dense_nodes",
-        "dense_activation",
-        "depth",
-        "lstm1_cells",
-        "lstm2_cells",
-        "dense3_nodes",
-        "dense3_activation",
-        "number_classes",
-        "number_channels",
-        "mesh_rows",
-        "mesh_columns",
-        "split_size",
-        "learning_rate",
-        "batch_size",
-        "dropout_rate"
-    ]
 
-    # For MEGClassifier (or similar, if used)
-    hyperparameters_classifier = [
-        "number_classes",
-        "num_temporal_filters",
-        "temporal_kernel_size",
-        "dropout_rate",
-        "activation",
-        "pool_size",
-        "number_classes",
-        "conv2d_channels",
-        "transformer_d_model",
-        "transformer_nhead",
-        "transformer_dim_feedforward",
-        "transformer_layers",
-        "fc_hidden",
-        "fc_dropout",
-        "learning_rate",
-        "batch_size",
-        "input_time_length",  # for windowing
-        "stride"              # for windowing
-    ]
-
-    if ModelClass == MultiviewAttention:
-        used_hyperparameters = hyperparameters
-    else:
-        used_hyperparameters = hyperparameters_classifier
+    # --- Dynamically get all possible hyperparameters from the search space ---
+    # Use a dummy trial and dummy train_data to extract all keys
+    import optuna
+    class DummyTrial:
+        def suggest_categorical(self, name, choices): return choices[0]
+        def suggest_int(self, name, low, high, step=1): return low
+        def suggest_float(self, name, low, high, step=None, log=False): return low
+    dummy_trial = DummyTrial()
+    # Use a dummy tensor with shape (N, C, T)
+    dummy_train_data = torch.zeros(1, 248, 212)  # 248 channels, 212 time (arbitrary but valid)
+    try:
+        hyperparams = get_hyperparameter_search_space(dummy_trial, dummy_train_data)
+        used_hyperparameters = list(hyperparams.keys())
+    except Exception as e:
+        # fallback: use static list if dummy fails
+        if ModelClass == MultiviewAttention:
+            used_hyperparameters = [
+                "window_size", "conv1_filters", "conv2_filters", "conv3_filters",
+                "conv1_kernel_shape", "conv2_kernel_shape", "conv3_kernel_shape",
+                "padding1", "padding2", "padding3",
+                "conv1_activation", "conv2_activation", "conv3_activation",
+                "dense_nodes", "dense_activation", "depth",
+                "lstm1_cells", "lstm2_cells", "dense3_nodes", "dense3_activation",
+                "number_classes", "number_channels", "mesh_rows", "mesh_columns", "split_size",
+                "learning_rate", "batch_size", "dropout_rate", "optimizer", "weight_decay",
+                "label_smoothing", "transformer_nhead", "transformer_num_layers"
+            ]
+        else:
+            used_hyperparameters = [
+                "number_classes", "num_temporal_filters", "temporal_kernel_size", "dropout_rate",
+                "activation", "pool_size", "conv2d_channels", "transformer_d_model",
+                "transformer_nhead", "transformer_dim_feedforward", "transformer_layers",
+                "fc_hidden", "fc_dropout", "learning_rate", "batch_size",
+                "input_time_length", "stride"
+            ]
 
     # Generate columns for train, val, and test metrics
     columns = ["trial_id", "epoch"]
@@ -346,7 +378,6 @@ def create_metrics_df():
     # Create the DataFrame
     all_metrics_df = pd.DataFrame(columns=columns)
 
-    # Example: Print the generated columns
     if debug_mode:
         print("Generated columns:")
         print(all_metrics_df.columns)
@@ -390,7 +421,15 @@ def train_full_model(
     Returns:
         model (torch.nn.Module): The trained model.
     """
-    optimizer, scheduler, criterion = get_training_parts(model, lr=lr)
+
+    optimizer_name = hyperparams.get("optimizer", "adam")
+    weight_decay = hyperparams.get("weight_decay", 1e-4)
+    label_smoothing = hyperparams.get("label_smoothing", 0.1)
+
+    optimizer, scheduler, criterion = get_training_parts(model, lr=lr, max_epochs=epochs,
+                                                         optimizer_name=optimizer_name,
+                                                         weight_decay=weight_decay,
+                                                         label_smoothing=label_smoothing)
 
     for epoch in range(epochs):
         single_train_epoch(model, train_loader, optimizer, criterion, device)
@@ -515,17 +554,25 @@ def get_multiview_dataloader(data_tensor, df, batch_size, window_size, mesh_rows
 
 def get_multiview_dataloaders(
     data_tensor, df, fold_index=None, n_splits=4, batch_size=64,
-    window_size=4, mesh_rows=20, mesh_columns=21, depth=248
+    window_size=4, mesh_rows=20, mesh_columns=21, depth=248, property_to_split_on='patient_id'
 ):
     """
     Like get_dataloaders, but for MultiviewDataset.
     Ensures each fold contains only unseen patients in validation.
     Returns: train_loader, val_loader, train_df, val_df
     """
-    groups = df["patient_id"].values
-    gkf = GroupKFold(n_splits=n_splits)
-    splits = list(gkf.split(np.zeros(len(groups)), groups=groups))
-    train_idx, val_idx = splits[fold_index]
+
+    if property_to_split_on == 'patient_id':
+        groups = df["patient_id"].values
+        gkf = GroupKFold(n_splits=n_splits)
+        splits = list(gkf.split(np.zeros(len(groups)), groups=groups))
+        train_idx, val_idx = splits[fold_index]
+    else: # elif property_to_split_on == 'task_type_cat':
+        # Use task_type_cat for stratified split if groups are not sufficient
+        groups = df['task_type_cat'].values
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        splits = list(skf.split(np.zeros(len(groups)), groups))
+        train_idx, val_idx = splits[fold_index]
 
     train_df2 = df.iloc[train_idx]
     val_df2 = df.iloc[val_idx]
@@ -589,7 +636,14 @@ def train_model(
     all_metrics_df, hyperparams, task_names, fold_idx, min_delta=1e-4, best_model_path=None
 ):
     model.to(device)
-    optimizer, scheduler, criterion = get_training_parts(model, lr=lr)  # Initialize optimizer, scheduler, and criterion
+
+    optimizer_name = hyperparams.get("optimizer", "adam")
+    weight_decay = hyperparams.get("weight_decay", 1e-4)
+    label_smoothing = hyperparams.get("label_smoothing", 0.1)
+    optimizer, scheduler, criterion = get_training_parts(model, lr=lr, max_epochs=epochs,
+                                                         optimizer_name=optimizer_name,
+                                                         weight_decay=weight_decay,
+                                                         label_smoothing=label_smoothing)
 
     best_val_loss = float('inf')
     best_val_acc = 0.0
@@ -701,6 +755,12 @@ def train_model(
     return best_val_acc, all_metrics_df, train_accs, val_accs, train_losses, val_losses
 
 # --- Optuna workflow ---
+def compute_conv2d_output_size(H, W, kernel_size, padding, stride=1, dilation=1):
+    # Standard PyTorch Conv2d output size formula
+    out_h = (H + 2*padding - dilation*(kernel_size[0]-1) - 1)//stride + 1
+    out_w = (W + 2*padding - dilation*(kernel_size[1]-1) - 1)//stride + 1
+    return out_h, out_w
+
 def get_hyperparameter_search_space(trial, train_data):
     """
     Define the hyperparameter search space for Optuna.
@@ -712,7 +772,7 @@ def get_hyperparameter_search_space(trial, train_data):
         dict: A dictionary containing the hyperparameter search space.
     """
     if ModelClass == MultiviewAttention:
-        window_size = trial.suggest_categorical('window_size', [4, 8, 16])
+        window_size = trial.suggest_categorical('window_size', [4, 8])
         T = train_data.shape[2]
         split_size = T // window_size
 
@@ -721,89 +781,142 @@ def get_hyperparameter_search_space(trial, train_data):
         if not mesh_row_candidates:
             raise optuna.TrialPruned(f"No valid mesh_rows for split_size={split_size}")
 
-        # Now, mesh_row_candidates is fixed for this trial, so it's safe to suggest
         mesh_rows = mesh_row_candidates[trial.suggest_int('mesh_rows_index', 0, len(mesh_row_candidates) - 1)]
         mesh_columns = split_size // mesh_rows
 
+        # --- FIX: Use fixed choices for Optuna, prune invalid combos after suggestion ---
+        ALL_KERNEL_SHAPES = [(3, 3), (5, 5)]
+        ALL_PADDINGS = [1, 2]
+
         hyperparams = {
-            "window_size": trial.suggest_categorical('window_size', [4, 8, 16]),
-            "conv1_filters": trial.suggest_categorical('conv1_filters', [16, 32, 64, 128]),
-            "conv2_filters": trial.suggest_categorical('conv2_filters', [32, 64, 128, 256]),
-            "conv3_filters": trial.suggest_categorical('conv3_filters', [64, 128, 256]),
-            "conv1_kernel_shape": trial.suggest_categorical('conv1_kernel_shape', [(3, 3), (5, 5), (7, 7)]),
-            "conv2_kernel_shape": trial.suggest_categorical('conv2_kernel_shape', [(3, 3), (5, 5), (7, 7)]),
-            "conv3_kernel_shape": trial.suggest_categorical('conv3_kernel_shape', [(3, 3), (5, 5), (7, 7)]),
-            "padding1": trial.suggest_categorical('padding1', [0, 1, 2, 3]),
-            "padding2": trial.suggest_categorical('padding2', [0, 1, 2, 3]),
-            "padding3": trial.suggest_categorical('padding3', [0, 1, 2, 3]),
-            "conv1_activation": trial.suggest_categorical('conv1_activation', ['relu', 'elu', 'leaky_relu', 'gelu']),
-            "conv2_activation": trial.suggest_categorical('conv2_activation', ['relu', 'elu', 'leaky_relu', 'gelu']),
-            "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'elu', 'leaky_relu', 'gelu']),
-            "dense_nodes": trial.suggest_categorical('dense_nodes', [32, 64, 128, 256]),
-            "dense_activation": trial.suggest_categorical('dense_activation', ['relu', 'elu', 'leaky_relu', 'gelu']),
+            "window_size": window_size,
+            "conv1_filters": trial.suggest_categorical('conv1_filters', [128]),
+            "conv2_filters": trial.suggest_categorical('conv2_filters', [256]),
+            "conv3_filters": trial.suggest_categorical('conv3_filters', [64, 256]),
+            "conv1_kernel_shape": trial.suggest_categorical('conv1_kernel_shape', ALL_KERNEL_SHAPES),
+            "conv2_kernel_shape": trial.suggest_categorical('conv2_kernel_shape', ALL_KERNEL_SHAPES),
+            "conv3_kernel_shape": trial.suggest_categorical('conv3_kernel_shape', ALL_KERNEL_SHAPES),
+            "padding1": trial.suggest_categorical('padding1', ALL_PADDINGS),
+            "padding2": trial.suggest_categorical('padding2', ALL_PADDINGS),
+            "padding3": trial.suggest_categorical('padding3', ALL_PADDINGS),
+            "conv1_activation": trial.suggest_categorical('conv1_activation', ['leaky_relu', 'gelu']),
+            "conv2_activation": trial.suggest_categorical('conv2_activation', ['relu', 'leaky_relu']),
+            "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'elu']),
+            "dense_nodes": trial.suggest_categorical('dense_nodes', [128, 256]),
+            "dense_activation": trial.suggest_categorical('dense_activation', ['relu', 'gelu']),
             "depth": trial.suggest_categorical('depth', [train_data.shape[1]]),
-            "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 64, 128, 256]),
-            "lstm2_cells": trial.suggest_categorical('lstm2_cells', [32, 64, 128, 256]),
-            "dense3_nodes": trial.suggest_categorical('dense3_nodes', [32, 64, 128, 256]),
-            "dense3_activation": trial.suggest_categorical('dense3_activation', ['relu', 'elu', 'leaky_relu', 'gelu']),
+            "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 128]),
+            "lstm2_cells": trial.suggest_categorical('lstm2_cells', [32, 64, 128]),
+            "dense3_nodes": trial.suggest_categorical('dense3_nodes', [32, 64, 128]),
+            "dense3_activation": trial.suggest_categorical('dense3_activation', ['relu', 'gelu']),
             "number_classes": len(np.unique(TASKS)),
             "number_channels": train_data.shape[1],
             "mesh_rows": mesh_rows,
             "mesh_columns": mesh_columns,
             "split_size": split_size,
-            "learning_rate": trial.suggest_float('learning_rate', 1e-5, 5e-3, log=True),
-            "batch_size": trial.suggest_categorical('batch_size', [8, 16, 32, 64]),
-            "dropout_rate": trial.suggest_float('dropout_rate', 0.05, 0.4, step=0.05),
-            "optimizer": trial.suggest_categorical('optimizer', ['adam', 'adamw', 'rmsprop']),
-            "weight_decay": trial.suggest_float('weight_decay', 1e-8, 1e-2, log=True),
+            "learning_rate": trial.suggest_float('learning_rate', 1e-4, 2e-3, log=True),
+            "batch_size": trial.suggest_categorical('batch_size', [4, 8, 16]),
+            "dropout_rate": trial.suggest_float('dropout_rate', 0.05, 0.15, step=0.05),
+            "optimizer": trial.suggest_categorical('optimizer', ['adam', 'adamw']),
+            "weight_decay": trial.suggest_float('weight_decay', 1e-8, 1e-3, log=True),
             "label_smoothing": trial.suggest_float('label_smoothing', 0.0, 0.2, step=0.05),
-            "transformer_nhead": trial.suggest_categorical('transformer_nhead', [2, 4, 8]),
-            "transformer_layers": trial.suggest_int('transformer_layers', 1, 2),
+            "transformer_nhead": trial.suggest_categorical('transformer_nhead', [8, 16]),
+            "transformer_num_layers": trial.suggest_int('transformer_num_layers', 1, 3, step=1),
         }
+
+        # Prune if any kernel shape or padding is invalid for the mesh size
+        for kernel_shape, padding, name in [
+            (hyperparams["conv1_kernel_shape"], hyperparams["padding1"], "conv1"),
+            (hyperparams["conv2_kernel_shape"], hyperparams["padding2"], "conv2"),
+            (hyperparams["conv3_kernel_shape"], hyperparams["padding3"], "conv3"),
+        ]:
+            if (mesh_rows + 2 * padding) < kernel_shape[0] or (mesh_columns + 2 * padding) < kernel_shape[1]:
+                raise optuna.TrialPruned(
+                    f"{name}: (mesh_rows + 2*padding)={mesh_rows + 2*padding}, (mesh_columns + 2*padding)={mesh_columns + 2*padding}, "
+                    f"kernel_shape={kernel_shape} (padding={padding})"
+                )
+        # FINAL CHECK: ensure all kernel shapes fit input
+        for kernel_shape, padding, name in [
+            (hyperparams["conv1_kernel_shape"], hyperparams["padding1"], "conv1"),
+            (hyperparams["conv2_kernel_shape"], hyperparams["padding2"], "conv2"),
+            (hyperparams["conv3_kernel_shape"], hyperparams["padding3"], "conv3"),
+        ]:
+            effective_rows = mesh_rows + 2 * padding
+            effective_cols = mesh_columns + 2 * padding
+            if effective_rows < kernel_shape[0] or effective_cols < kernel_shape[1]:
+                raise optuna.TrialPruned(
+                    f"FINAL CHECK {name}: effective_rows={effective_rows}, effective_cols={effective_cols}, "
+                    f"kernel_shape={kernel_shape} (padding={padding})"
+                )
+            
+        # After you build hyperparams and before returning:
+        H, W = mesh_rows, mesh_columns
+        for i, (k, p, name) in enumerate([
+            (hyperparams["conv1_kernel_shape"], hyperparams["padding1"], "conv1"),
+            (hyperparams["conv2_kernel_shape"], hyperparams["padding2"], "conv2"),
+            (hyperparams["conv3_kernel_shape"], hyperparams["padding3"], "conv3"),
+        ]):
+            H, W = compute_conv2d_output_size(H, W, k, p)
+            if H < 1 or W < 1:
+                raise optuna.TrialPruned(
+                    f"{name}: Output size after conv would be ({H}, {W}) with kernel {k} and padding {p}."
+                )
+            if H < k[0] or W < k[1]:
+                raise optuna.TrialPruned(
+                    f"{name}: Output size ({H}, {W}) too small for next kernel {k}."
+                )
     else:
         hyperparams = {
-        "number_classes": train_data.shape[1],
-        "num_temporal_filters": trial.suggest_categorical('num_temporal_filters', [32, 64]),
-        "temporal_kernel_size": trial.suggest_categorical('temporal_kernel_size', [32, 64]),
-        "dropout_rate": trial.suggest_float('dropout_rate', 0.2, 0.6, step=0.1),
-        "activation": trial.suggest_categorical('activation', ['relu', 'gelu']),
-        "pool_size": trial.suggest_categorical('pool_size', [2, 4]),
-        "number_classes": len(np.unique(TASKS)),
-        "conv2d_channels": trial.suggest_categorical("conv2d_channels", ["32_64"]),
-        "transformer_d_model": trial.suggest_categorical('transformer_d_model', [128]),
-        "transformer_nhead": trial.suggest_categorical('transformer_nhead', [4]),
-        "transformer_dim_feedforward": trial.suggest_categorical('transformer_dim_feedforward', [128, 256]),
-        "transformer_layers": trial.suggest_int('transformer_layers', 1, 1),
-        "fc_hidden": trial.suggest_categorical('fc_hidden', [64, 128]),
-        "fc_dropout": trial.suggest_float('fc_dropout', 0.2, 0.6, step=0.1),
-        "learning_rate": trial.suggest_float('learning_rate', 1e-4, 5e-3, log=True),
-        "batch_size": trial.suggest_categorical('batch_size', [16, 32]),
-        "input_time_length": trial.suggest_categorical('input_time_length', [256, 512]),
-        "stride": trial.suggest_categorical('stride', [256, 512])
-    }
-        
-    return hyperparams
+            "number_classes": train_data.shape[1],
+            "num_temporal_filters": trial.suggest_categorical('num_temporal_filters', [32, 64]),
+            "temporal_kernel_size": trial.suggest_categorical('temporal_kernel_size', [32, 64]),
+            "dropout_rate": trial.suggest_float('dropout_rate', 0.2, 0.6, step=0.1),
+            "activation": trial.suggest_categorical('activation', ['relu', 'gelu']),
+            "pool_size": trial.suggest_categorical('pool_size', [2, 4]),
+            "number_classes": len(np.unique(TASKS)),
+            "conv2d_channels": trial.suggest_categorical("conv2d_channels", ["32_64"]),
+            "transformer_d_model": trial.suggest_categorical('transformer_d_model', [128]),
+            "transformer_nhead": trial.suggest_categorical('transformer_nhead', [4]),
+            "transformer_dim_feedforward": trial.suggest_categorical('transformer_dim_feedforward', [128, 256]),
+            "transformer_layers": trial.suggest_int('transformer_layers', 1, 1),
+            "fc_hidden": trial.suggest_categorical('fc_hidden', [64, 128]),
+            "fc_dropout": trial.suggest_float('fc_dropout', 0.2, 0.6, step=0.1),
+            "learning_rate": trial.suggest_float('learning_rate', 1e-4, 5e-3, log=True),
+            "batch_size": trial.suggest_categorical('batch_size', [16, 32]),
+            "input_time_length": trial.suggest_categorical('input_time_length', [256, 512]),
+            "stride": trial.suggest_categorical('stride', [256, 512])
+        }
 
-def get_training_parts(model, lr=1e-3, weight_decay=1e-4, max_epochs=100):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    return hyperparams
+        
+def get_training_parts(model, lr=1e-3, weight_decay=1e-4, label_smoothing=0.1, max_epochs=100, optimizer_name="adam"):
+    if optimizer_name == "adam":
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif optimizer_name == "rmsprop":
+        optimizer = torch.optim.RMSprop(model.parameters(), lr=lr, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_name}")
+    
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
     
     # Define your task names and desired weights
     task_weights_dict = {
-        "resting": 0.5,
-        "math": 2.5,
-        "memory": 5.0,  # Give more weight to "memory"
-        "motor": 1.5
+        "resting": 1,
+        "math": 2,
+        "memory": 4,  # Give more weight to "memory"
+        "motor": 2
     }
     # Make sure TASKS is in the same order as your class indices
     class_weights = torch.tensor([task_weights_dict[task] for task in TASKS], dtype=torch.float32).to(next(model.parameters()).device)
     
-    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1, weight=class_weights)
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing, weight=class_weights)
     return optimizer, scheduler, criterion
 
 
 def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, best_model_path=None,
-              plot_path=None):
+              plot_path=None, property_to_split_on='task_type_cat'):
     # Define hyperparameters using trial
     hyperparams = get_hyperparameter_search_space(trial, train_data)
 
@@ -823,7 +936,8 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
                 window_size=hyperparams["window_size"],
                 mesh_rows=hyperparams["mesh_rows"],
                 mesh_columns=hyperparams["mesh_columns"],
-                depth=hyperparams["depth"]
+                depth=hyperparams["depth"],
+                property_to_split_on=property_to_split_on
             )
         else:
             train_loader, val_loader, train_df2, val_df2 = get_dataloaders(
@@ -853,7 +967,7 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
             attempt_index=trial_index,
             epochs=50,
             lr=hyperparams["learning_rate"],
-            patience=5,
+            patience=10,
             device=device,
             all_metrics_df=all_metrics_df,
             hyperparams=hyperparams,

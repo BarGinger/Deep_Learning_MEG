@@ -5,3 +5,6 @@ Data/Final Project data.zip
 __pycache__
 /__pycache__
 __pycache__/Model.cpython-312.pyc
+/__pycache__
+__pycache__/Model.cpython-312.pyc
+*.pth

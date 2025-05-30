@@ -208,7 +208,10 @@ class MultiviewAttention(nn.Module):
         number_channels=248,
         mesh_rows=20,
         mesh_columns=21,
-        split_size=None        
+        split_size=None,
+        transformer_nhead=4,
+        transformer_num_layers=1
+
     ):
         super().__init__()
         self.window_size = window_size
@@ -221,6 +224,8 @@ class MultiviewAttention(nn.Module):
         self.split_size = split_size
         self.dropout_rate = dropout_rate
         self.dropout = nn.Dropout(self.dropout_rate)
+        self.transformer_nhead = transformer_nhead
+        self.transformer_num_layers = transformer_num_layers
 
         # Activation functions
         activations = {
@@ -273,7 +278,7 @@ class MultiviewAttention(nn.Module):
         ])
 
         # Self-attention mechanism
-        self.attention = nn.MultiheadAttention(embed_dim=dense_nodes, num_heads=4, batch_first=True)
+        self.attention = nn.MultiheadAttention(embed_dim=dense_nodes, num_heads=transformer_nhead, batch_first=True)
 
         # LSTM branches for each window
         self.lstm_dense = nn.ModuleList([
@@ -295,8 +300,8 @@ class MultiviewAttention(nn.Module):
 
         # Transformer encoder block (NEW)
         self.transformer_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=dense_nodes, nhead=4, batch_first=True, dropout=self.dropout_rate),
-            num_layers=1
+            nn.TransformerEncoderLayer(d_model=dense_nodes, nhead=transformer_nhead, batch_first=True, dropout=self.dropout_rate),
+            num_layers=transformer_num_layers
         )
 
         # Dense after LSTM

@@ -1,0 +1,45 @@
+{
+    "window_size": 8,
+    "mesh_rows_index": 1,
+    "conv1_filters": 128,
+    "conv2_filters": 256,
+    "conv3_filters": 64,
+    "conv1_kernel_shape": [
+        5,
+        5
+    ],
+    "conv2_kernel_shape": [
+        5,
+        5
+    ],
+    "conv3_kernel_shape": [
+        5,
+        5
+    ],
+    "padding1": 2,
+    "padding2": 1,
+    "padding3": 1,
+    "conv1_activation": "leaky_relu",
+    "conv2_activation": "leaky_relu",
+    "conv3_activation": "relu",
+    "dense_nodes": 128,
+    "dense_activation": "relu",
+    "depth": 248,
+    "lstm1_cells": 128,
+    "lstm2_cells": 128,
+    "dense3_nodes": 64,
+    "dense3_activation": "relu",
+    "learning_rate": 0.0001534910618821226,
+    "batch_size": 4,
+    "dropout_rate": 0.1,
+    "optimizer": "adam",
+    "weight_decay": 6.155941480246255e-06,
+    "label_smoothing": 0.05,
+    "transformer_nhead": 16,
+    "transformer_num_layers": 2,
+    "number_channels": 248,
+    "number_classes": 4,
+    "split_size": 636,
+    "mesh_rows": 12,
+    "mesh_columns": 53
+}
