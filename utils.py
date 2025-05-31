@@ -34,7 +34,7 @@ import zipfile
 import random
 import optuna
 import json
-from Model import MEGClassifier, MultiviewAttention, MultiviewDataset, MultiviewAttentionRef
+from Model import MultiviewDataset, MultiviewAttention
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.model_selection import StratifiedKFold
 import matplotlib.pyplot as plt
@@ -46,7 +46,7 @@ debug_mode = False  # controls whether to print debug information
 TASKS = ["resting", "math", "memory", "motor"]
 METRICS = ["accuracy", "F1", "recall", "precision"]
 # selced model to train
-ModelClass = MultiviewAttentionRef # MultiviewAttention  # or MEGClassifier, etc.
+ModelClass = MultiviewAttention
 
 # functions
 def get_dataset_from_h5py(filename_path):
@@ -344,7 +344,7 @@ def create_metrics_df():
         used_hyperparameters = list(hyperparams.keys())
     except Exception as e:
         # fallback: use static list if dummy fails
-        if ModelClass in [MultiviewAttention, MultiviewAttentionRef]:
+        if ModelClass in [MultiviewAttention]:
             used_hyperparameters = [
                 "window_size", "conv1_filters", "conv2_filters", "conv3_filters",
                 "conv1_kernel_shape", "conv2_kernel_shape", "conv3_kernel_shape",
@@ -429,26 +429,26 @@ def train_full_model(
     best_trial = study.best_trial
     best_params = best_trial.params.copy()
     best_params["number_channels"] = train_data.shape[1]
-    best_params["depth"] = train_data.shape[1]
+    best_params["depth"] = 1  # <-- set to 1 for new model
     best_params["number_classes"] = len(np.unique(train_df['task_type']))
     best_params["num_classes"] = len(np.unique(train_df['task_type']))
 
-    # Recompute split_size and mesh_columns if missing
+    # Recompute split_size if missing
     if "split_size" not in best_params:
         T = train_data.shape[2]
-        best_params["split_size"] = T // best_params["window_size"] 
+        best_params["split_size"] = T // best_params["window_size"]
 
-    if "mesh_rows" not in best_params and "mesh_rows_index" in best_params:
-        best_params["mesh_rows"] =  get_mesh_candidate(split_size=best_params["split_size"], mesh_rows_index=best_params["mesh_rows_index"])
-
+    # Always set mesh_rows and mesh_columns for new model
+    if "mesh_rows" not in best_params:
+        best_params["mesh_rows"] = 8
     if "mesh_columns" not in best_params:
-        best_params["mesh_columns"] = best_params["split_size"] // best_params["mesh_rows"]
+        best_params["mesh_columns"] = 31
 
     # Instantiate model
     best_model = ModelClass(**{k: v for k, v in best_params.items() if k in ModelClass.__init__.__code__.co_varnames}).to(device)
 
     # Dataloader
-    if ModelClass.__name__ in ["MultiviewAttention", "MultiviewAttentionRef"]:
+    if ModelClass.__name__ in ["MultiviewAttention"]:
         train_loader = get_multiview_dataloader(
             train_data, train_df,
             batch_size=best_params["batch_size"],
@@ -535,13 +535,13 @@ def single_train_epoch(model, train_loader, optimizer, criterion, device):
             y_batch = y_batch.to(device)
             optimizer.zero_grad()
             outputs = model(x_cnn_list, x_lstm_list)
-        elif isinstance(model, MultiviewAttentionRef):
-            # expects only x_cnn_list
-            x_cnn_list, x_lstm_list, y_batch = batch
-            x_cnn_list = [x.to(device) for x in x_cnn_list]
-            y_batch = y_batch.to(device)
-            optimizer.zero_grad()
-            outputs = model(x_cnn_list)
+        # elif isinstance(model, MultiviewAttentionOriginal):
+        #     # expects only x_cnn_list
+        #     x_cnn_list, x_lstm_list, y_batch = batch
+        #     x_cnn_list = [x.to(device) for x in x_cnn_list]
+        #     y_batch = y_batch.to(device)
+        #     optimizer.zero_grad()
+        #     outputs = model(x_cnn_list)
         else:
             x_batch, y_batch = batch
             x_batch = x_batch.to(device)
@@ -576,12 +576,12 @@ def single_eval_epoch(model, val_loader, criterion, device):
                 x_lstm_list = [x.to(device) for x in x_lstm_list]
                 y_batch = y_batch.to(device)
                 outputs = model(x_cnn_list, x_lstm_list)
-            elif isinstance(model, MultiviewAttentionRef):
-                # expects only x_cnn_list
-                x_cnn_list, x_lstm_list, y_batch = batch
-                x_cnn_list = [x.to(device) for x in x_cnn_list]
-                y_batch = y_batch.to(device)
-                outputs = model(x_cnn_list)
+            # elif isinstance(model, MultiviewAttentionOriginal):
+            #     # expects only x_cnn_list
+            #     x_cnn_list, x_lstm_list, y_batch = batch
+            #     x_cnn_list = [x.to(device) for x in x_cnn_list]
+            #     y_batch = y_batch.to(device)
+            #     outputs = model(x_cnn_list)
             else:
                 x_batch, y_batch = batch
                 x_batch = x_batch.to(device)
@@ -825,63 +825,24 @@ def compute_conv2d_output_size(H, W, kernel_size, padding, stride=1, dilation=1)
     out_w = (W + 2*padding - dilation*(kernel_size[1]-1) - 1)//stride + 1
     return out_h, out_w
 
+
+
 def get_hyperparameter_search_space(trial, train_data):
     """
-    Define the hyperparameter search space for Optuna.
-
-    Parameters:
-        trial (optuna.Trial): The Optuna trial object.
-        train_data (torch.Tensor): The training data tensor, used to infer input dimensions.
-    Returns:
-        dict: A dictionary containing the hyperparameter search space.
+    Define the hyperparameter search space for Optuna, using mesh_rows=8 and mesh_columns=31 for 248 channels.
     """
-    if ModelClass == MultiviewAttentionRef:
-        window_size = trial.suggest_categorical('window_size', [10, 12, 14, 16, 18, 20])
-        T = train_data.shape[2]
-        split_size = T // window_size
-
-        mesh_row_candidates = get_mesh_candidates(split_size)
-        if not mesh_row_candidates:
-            raise optuna.TrialPruned(f"No valid mesh_rows for split_size={split_size}")
-
-        mesh_rows_index = trial.suggest_int('mesh_rows_index', 0, len(mesh_row_candidates) - 1)
-        mesh_rows = get_mesh_candidate(split_size=split_size, mesh_rows_index=mesh_rows_index)
-        mesh_columns = split_size // mesh_rows
-
-        hyperparams = {
-            "window_size": window_size,
-            "cnn_filters": trial.suggest_categorical('cnn_filters', [16, 32, 64, 128, 256]),
-            "lstm_hidden": trial.suggest_categorical('lstm_hidden', [32, 64, 96, 128]),
-            "dense_hidden": trial.suggest_categorical('dense_hidden', [32, 64, 96, 128]),
-            "num_classes": len(np.unique(TASKS)),
-            "depth": train_data.shape[1],
-            "mesh_rows": mesh_rows,
-            "mesh_columns": mesh_columns,
-            "split_size": split_size,
-            "learning_rate": trial.suggest_float('learning_rate', 1e-3, 2e-3, log=True),
-            "batch_size": trial.suggest_categorical('batch_size', [4, 8, 16]),
-            "dropout_rate": trial.suggest_float('dropout_rate', 0.3, 0.5, step=0.1),
-            "optimizer": trial.suggest_categorical('optimizer', ['adam', 'adamw']),
-            "weight_decay": trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
-            "label_smoothing": trial.suggest_float("label_smoothing", 0.1, 0.3, step=0.05)
-        }    
-    
-    elif ModelClass in [MultiviewAttention]:
+    if ModelClass in [MultiviewAttention]:
         window_size = trial.suggest_categorical('window_size', [4, 8])
         T = train_data.shape[2]
         split_size = T // window_size
 
-        # Find all possible (mesh_rows, mesh_columns) pairs for this split_size
-        mesh_row_candidates = get_mesh_candidates(split_size)
-        if not mesh_row_candidates:
-            raise optuna.TrialPruned(f"No valid mesh_rows for split_size={split_size}")
-
-        mesh_rows = mesh_row_candidates[trial.suggest_int('mesh_rows_index', 0, len(mesh_row_candidates) - 1)]
-        mesh_columns = split_size // mesh_rows
-
-        # --- FIX: Use fixed choices for Optuna, prune invalid combos after suggestion ---
         ALL_KERNEL_SHAPES = [(3, 3), (5, 5)]
         ALL_PADDINGS = [1, 2]
+
+        # For 248 channels, depth=1, mesh_rows=8, mesh_columns=31 is correct
+        depth = 1
+        mesh_rows = 8
+        mesh_columns = 31
 
         hyperparams = {
             "window_size": window_size,
@@ -899,7 +860,7 @@ def get_hyperparameter_search_space(trial, train_data):
             "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'elu']),
             "dense_nodes": trial.suggest_categorical('dense_nodes', [128, 256]),
             "dense_activation": trial.suggest_categorical('dense_activation', ['relu', 'gelu']),
-            "depth": trial.suggest_categorical('depth', [train_data.shape[1]]),
+            "depth": depth,# train_data.shape[1],
             "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 128]),
             "lstm2_cells": trial.suggest_categorical('lstm2_cells', [32, 64, 128]),
             "dense3_nodes": trial.suggest_categorical('dense3_nodes', [32, 64, 128]),
@@ -915,6 +876,7 @@ def get_hyperparameter_search_space(trial, train_data):
             "optimizer": trial.suggest_categorical('optimizer', ['adam', 'adamw']),
             "weight_decay": trial.suggest_float('weight_decay', 1e-8, 1e-3, log=True),
             "label_smoothing": trial.suggest_float('label_smoothing', 0.0, 0.2, step=0.05),
+            "number_of_heads": trial.suggest_categorical('number_of_heads', [2, 3]),
             "transformer_nhead": trial.suggest_categorical('transformer_nhead', [8, 16]),
             "transformer_num_layers": trial.suggest_int('transformer_num_layers', 1, 3, step=1),
         }
@@ -931,26 +893,12 @@ def get_hyperparameter_search_space(trial, train_data):
                     f"kernel_shape={kernel_shape} (padding={padding})"
                 )
         # FINAL CHECK: ensure all kernel shapes fit input
-        for kernel_shape, padding, name in [
+        H, W = mesh_rows, mesh_columns
+        for k, p, name in [
             (hyperparams["conv1_kernel_shape"], hyperparams["padding1"], "conv1"),
             (hyperparams["conv2_kernel_shape"], hyperparams["padding2"], "conv2"),
             (hyperparams["conv3_kernel_shape"], hyperparams["padding3"], "conv3"),
         ]:
-            effective_rows = mesh_rows + 2 * padding
-            effective_cols = mesh_columns + 2 * padding
-            if effective_rows < kernel_shape[0] or effective_cols < kernel_shape[1]:
-                raise optuna.TrialPruned(
-                    f"FINAL CHECK {name}: effective_rows={effective_rows}, effective_cols={effective_cols}, "
-                    f"kernel_shape={kernel_shape} (padding={padding})"
-                )
-            
-        # After you build hyperparams and before returning:
-        H, W = mesh_rows, mesh_columns
-        for i, (k, p, name) in enumerate([
-            (hyperparams["conv1_kernel_shape"], hyperparams["padding1"], "conv1"),
-            (hyperparams["conv2_kernel_shape"], hyperparams["padding2"], "conv2"),
-            (hyperparams["conv3_kernel_shape"], hyperparams["padding3"], "conv3"),
-        ]):
             H, W = compute_conv2d_output_size(H, W, k, p)
             if H < 1 or W < 1:
                 raise optuna.TrialPruned(
@@ -960,6 +908,131 @@ def get_hyperparameter_search_space(trial, train_data):
                 raise optuna.TrialPruned(
                     f"{name}: Output size ({H}, {W}) too small for next kernel {k}."
                 )
+    # elif ModelClass == MultiviewAttentionOriginal:
+    #     window_size = trial.suggest_categorical('window_size', [10, 12, 14, 16, 18, 20])
+    #     T = train_data.shape[2]
+    #     split_size = T // window_size
+
+    #     mesh_row_candidates = get_mesh_candidates(split_size)
+    #     if not mesh_row_candidates:
+    #         raise optuna.TrialPruned(f"No valid mesh_rows for split_size={split_size}")
+
+    #     mesh_rows_index = trial.suggest_int('mesh_rows_index', 0, len(mesh_row_candidates) - 1)
+    #     mesh_rows = get_mesh_candidate(split_size=split_size, mesh_rows_index=mesh_rows_index)
+    #     mesh_columns = split_size // mesh_rows
+
+    #     hyperparams = {
+    #         "window_size": window_size,
+    #         "cnn_filters": trial.suggest_categorical('cnn_filters', [16, 32, 64, 128, 256]),
+    #         "lstm_hidden": trial.suggest_categorical('lstm_hidden', [32, 64, 96, 128]),
+    #         "dense_hidden": trial.suggest_categorical('dense_hidden', [32, 64, 96, 128]),
+    #         "num_classes": len(np.unique(TASKS)),
+    #         "depth": train_data.shape[1],
+    #         "mesh_rows": mesh_rows,
+    #         "mesh_columns": mesh_columns,
+    #         "split_size": split_size,
+    #         "learning_rate": trial.suggest_float('learning_rate', 1e-3, 2e-3, log=True),
+    #         "batch_size": trial.suggest_categorical('batch_size', [4, 8, 16]),
+    #         "dropout_rate": trial.suggest_float('dropout_rate', 0.3, 0.5, step=0.1),
+    #         "optimizer": trial.suggest_categorical('optimizer', ['adam', 'adamw']),
+    #         "weight_decay": trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
+    #         "label_smoothing": trial.suggest_float("label_smoothing", 0.1, 0.3, step=0.05)
+    #     }    
+    
+    # elif ModelClass in [MultiviewAttention]:
+    #     window_size = trial.suggest_categorical('window_size', [4, 8])
+    #     T = train_data.shape[2]
+    #     split_size = T // window_size
+
+    #     # Find all possible (mesh_rows, mesh_columns) pairs for this split_size
+    #     mesh_row_candidates = get_mesh_candidates(split_size)
+    #     if not mesh_row_candidates:
+    #         raise optuna.TrialPruned(f"No valid mesh_rows for split_size={split_size}")
+
+    #     mesh_rows = mesh_row_candidates[trial.suggest_int('mesh_rows_index', 0, len(mesh_row_candidates) - 1)]
+    #     mesh_columns = split_size // mesh_rows
+
+    #     # --- FIX: Use fixed choices for Optuna, prune invalid combos after suggestion ---
+    #     ALL_KERNEL_SHAPES = [(3, 3), (5, 5)]
+    #     ALL_PADDINGS = [1, 2]
+
+    #     hyperparams = {
+    #         "window_size": window_size,
+    #         "conv1_filters": trial.suggest_categorical('conv1_filters', [128]),
+    #         "conv2_filters": trial.suggest_categorical('conv2_filters', [256]),
+    #         "conv3_filters": trial.suggest_categorical('conv3_filters', [64, 256]),
+    #         "conv1_kernel_shape": trial.suggest_categorical('conv1_kernel_shape', ALL_KERNEL_SHAPES),
+    #         "conv2_kernel_shape": trial.suggest_categorical('conv2_kernel_shape', ALL_KERNEL_SHAPES),
+    #         "conv3_kernel_shape": trial.suggest_categorical('conv3_kernel_shape', ALL_KERNEL_SHAPES),
+    #         "padding1": trial.suggest_categorical('padding1', ALL_PADDINGS),
+    #         "padding2": trial.suggest_categorical('padding2', ALL_PADDINGS),
+    #         "padding3": trial.suggest_categorical('padding3', ALL_PADDINGS),
+    #         "conv1_activation": trial.suggest_categorical('conv1_activation', ['leaky_relu', 'gelu']),
+    #         "conv2_activation": trial.suggest_categorical('conv2_activation', ['relu', 'leaky_relu']),
+    #         "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'elu']),
+    #         "dense_nodes": trial.suggest_categorical('dense_nodes', [128, 256]),
+    #         "dense_activation": trial.suggest_categorical('dense_activation', ['relu', 'gelu']),
+    #         "depth": trial.suggest_categorical('depth', [train_data.shape[1]]),
+    #         "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 128]),
+    #         "lstm2_cells": trial.suggest_categorical('lstm2_cells', [32, 64, 128]),
+    #         "dense3_nodes": trial.suggest_categorical('dense3_nodes', [32, 64, 128]),
+    #         "dense3_activation": trial.suggest_categorical('dense3_activation', ['relu', 'gelu']),
+    #         "number_classes": len(np.unique(TASKS)),
+    #         "number_channels": train_data.shape[1],
+    #         "mesh_rows": mesh_rows,
+    #         "mesh_columns": mesh_columns,
+    #         "split_size": split_size,
+    #         "learning_rate": trial.suggest_float('learning_rate', 1e-4, 2e-3, log=True),
+    #         "batch_size": trial.suggest_categorical('batch_size', [4, 8, 16]),
+    #         "dropout_rate": trial.suggest_float('dropout_rate', 0.05, 0.15, step=0.05),
+    #         "optimizer": trial.suggest_categorical('optimizer', ['adam', 'adamw']),
+    #         "weight_decay": trial.suggest_float('weight_decay', 1e-8, 1e-3, log=True),
+    #         "label_smoothing": trial.suggest_float('label_smoothing', 0.0, 0.2, step=0.05),
+    #         "transformer_nhead": trial.suggest_categorical('transformer_nhead', [8, 16]),
+    #         "transformer_num_layers": trial.suggest_int('transformer_num_layers', 1, 3, step=1),
+    #     }
+
+    #     # Prune if any kernel shape or padding is invalid for the mesh size
+    #     for kernel_shape, padding, name in [
+    #         (hyperparams["conv1_kernel_shape"], hyperparams["padding1"], "conv1"),
+    #         (hyperparams["conv2_kernel_shape"], hyperparams["padding2"], "conv2"),
+    #         (hyperparams["conv3_kernel_shape"], hyperparams["padding3"], "conv3"),
+    #     ]:
+    #         if (mesh_rows + 2 * padding) < kernel_shape[0] or (mesh_columns + 2 * padding) < kernel_shape[1]:
+    #             raise optuna.TrialPruned(
+    #                 f"{name}: (mesh_rows + 2*padding)={mesh_rows + 2*padding}, (mesh_columns + 2*padding)={mesh_columns + 2*padding}, "
+    #                 f"kernel_shape={kernel_shape} (padding={padding})"
+    #             )
+    #     # FINAL CHECK: ensure all kernel shapes fit input
+    #     for kernel_shape, padding, name in [
+    #         (hyperparams["conv1_kernel_shape"], hyperparams["padding1"], "conv1"),
+    #         (hyperparams["conv2_kernel_shape"], hyperparams["padding2"], "conv2"),
+    #         (hyperparams["conv3_kernel_shape"], hyperparams["padding3"], "conv3"),
+    #     ]:
+    #         effective_rows = mesh_rows + 2 * padding
+    #         effective_cols = mesh_columns + 2 * padding
+    #         if effective_rows < kernel_shape[0] or effective_cols < kernel_shape[1]:
+    #             raise optuna.TrialPruned(
+    #                 f"FINAL CHECK {name}: effective_rows={effective_rows}, effective_cols={effective_cols}, "
+    #                 f"kernel_shape={kernel_shape} (padding={padding})"
+    #             )
+            
+    #     # After you build hyperparams and before returning:
+    #     H, W = mesh_rows, mesh_columns
+    #     for i, (k, p, name) in enumerate([
+    #         (hyperparams["conv1_kernel_shape"], hyperparams["padding1"], "conv1"),
+    #         (hyperparams["conv2_kernel_shape"], hyperparams["padding2"], "conv2"),
+    #         (hyperparams["conv3_kernel_shape"], hyperparams["padding3"], "conv3"),
+    #     ]):
+    #         H, W = compute_conv2d_output_size(H, W, k, p)
+    #         if H < 1 or W < 1:
+    #             raise optuna.TrialPruned(
+    #                 f"{name}: Output size after conv would be ({H}, {W}) with kernel {k} and padding {p}."
+    #             )
+    #         if H < k[0] or W < k[1]:
+    #             raise optuna.TrialPruned(
+    #                 f"{name}: Output size ({H}, {W}) too small for next kernel {k}."
+    #             )
     else:
         hyperparams = {
             "number_classes": train_data.shape[1],
@@ -1022,7 +1095,7 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
     val_accs = []
 
     for fold_idx in range(n_splits):
-        if ModelClass in [MultiviewAttention, MultiviewAttentionRef]:
+        if ModelClass in [MultiviewAttention]:
             train_loader, val_loader, train_df2, val_df2 = get_multiview_dataloaders(
                 train_data, train_df,
                 fold_index=fold_idx,
@@ -1110,7 +1183,7 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
 
 def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64, input_time_length=256, stride=128, path=None):
     model.eval()
-    if isinstance(model, (MultiviewAttention, MultiviewAttentionRef)):
+    if isinstance(model, (MultiviewAttention)):
         test_loader = get_multiview_dataloader(
             test_data, test_df, batch_size=batch_size,
             window_size=model.window_size,
