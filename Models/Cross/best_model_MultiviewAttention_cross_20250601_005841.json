@@ -1,0 +1,46 @@
+{
+    "window_size": 8,
+    "conv1_filters": 128,
+    "conv2_filters": 256,
+    "conv3_filters": 64,
+    "conv1_kernel_shape": [
+        3,
+        3
+    ],
+    "conv2_kernel_shape": [
+        5,
+        5
+    ],
+    "conv3_kernel_shape": [
+        3,
+        3
+    ],
+    "padding1": 2,
+    "padding2": 1,
+    "padding3": 1,
+    "conv1_activation": "gelu",
+    "conv2_activation": "leaky_relu",
+    "conv3_activation": "elu",
+    "dense_nodes": 256,
+    "dense_activation": "gelu",
+    "lstm1_cells": 32,
+    "lstm2_cells": 64,
+    "dense3_nodes": 64,
+    "dense3_activation": "relu",
+    "learning_rate": 0.0006188753917850388,
+    "batch_size": 16,
+    "dropout_rate": 0.15,
+    "optimizer": "adam",
+    "weight_decay": 3.7923976849694333e-07,
+    "label_smoothing": 0.2,
+    "number_of_heads": 3,
+    "transformer_nhead": 16,
+    "transformer_num_layers": 2,
+    "number_channels": 248,
+    "depth": 1,
+    "number_classes": 4,
+    "num_classes": 4,
+    "split_size": 636,
+    "mesh_rows": 8,
+    "mesh_columns": 31
+}

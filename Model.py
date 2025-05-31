@@ -123,33 +123,49 @@ class SelfAttention2D(nn.Module):
             self.rel_width = None
 
     def _get_rel_embeddings(self, H, W, device):
-        # Only create if not already created or shape mismatch
+        # Always re-create if shape mismatch
         if (self.rel_height is None) or (self.rel_height.shape[0] != 2*H-1):
-            self.rel_height = nn.Parameter(torch.randn(2*H-1, self.dk // self.n_heads, device=device) * (self.dk // self.n_heads) ** -0.5)
+            self.rel_height = nn.Parameter(
+                torch.randn(2*H-1, self.dk // self.n_heads, device=device) * (self.dk // self.n_heads) ** -0.5,
+                requires_grad=True
+            )
         if (self.rel_width is None) or (self.rel_width.shape[0] != 2*W-1):
-            self.rel_width = nn.Parameter(torch.randn(2*W-1, self.dk // self.n_heads, device=device) * (self.dk // self.n_heads) ** -0.5)
+            self.rel_width = nn.Parameter(
+                torch.randn(2*W-1, self.dk // self.n_heads, device=device) * (self.dk // self.n_heads) ** -0.5,
+                requires_grad=True
+            )
 
-    def _relative_logits_1d(self, q, rel_k, H, W, transpose_mask):
-        # q: (B, n_heads, H, W, d_head)
-        # rel_k: (2*W-1, d_head)
-        rel_logits = torch.einsum('bhlwd,md->bhlwm', q, rel_k)  # (B, n_heads, H, W, 2W-1)
-        rel_logits = self._rel_to_abs(rel_logits)
-        rel_logits = rel_logits.unsqueeze(3).expand(-1, -1, -1, H, -1, -1)  # (B, n_heads, H, H, W, W)
-        rel_logits = rel_logits.permute(*transpose_mask)
-        rel_logits = rel_logits.reshape(q.shape[0], self.n_heads, H*W, H*W)
+    def _relative_logits_1d(self, q, rel_k, axis_size, other_axis_size, transpose_mask=None):
+        # q: (B, n_heads, H, W, d_head) or (B, n_heads, W, H, d_head)
+        # rel_k: (2*axis_size-1, d_head)
+        B, n_heads, A1, A2, d_head = q.shape  # A1 = axis_size, A2 = other_axis_size
+        # print("q.shape:", q.shape)
+        # print("rel_k.shape:", rel_k.shape)
+        rel_logits = torch.einsum('bhlad,md->bhlam', q, rel_k)  # (B, n_heads, A1, A2, 2A1-1)
+        rel_logits = rel_logits.permute(0, 3, 1, 2, 4)  # (B, A2, n_heads, A1, 2A1-1)
+        rel_logits = rel_logits.contiguous().view(B * A2 * n_heads, A1, 2*A1-1)
+        rel_logits = self._rel_to_abs(rel_logits)  # (B*A2*n_heads, A1, A1)
+        rel_logits = rel_logits.view(B, A2, n_heads, A1, A1).permute(0, 2, 1, 3, 4)  # (B, n_heads, A2, A1, A1)
+        rel_logits = rel_logits.reshape(B, n_heads, A2*A1, A1)
+        # Instead of expanding and reshaping, repeat along the correct axis to get (B, n_heads, HW, HW)
+        rel_logits = rel_logits.repeat(1, 1, 1, A2)  # (B, n_heads, A2*A1, A1*A2)
+        rel_logits = rel_logits[:, :, :, :A2*A1]     # Crop if needed
         return rel_logits
-    
+
     def _rel_to_abs(self, x):
-        # x: (B, n_heads, L, W, 2W-1)
-        B, n_heads, L, W, _ = x.shape
-        col_pad = torch.zeros((B, n_heads, L, W, 1), device=x.device, dtype=x.dtype)
-        x = torch.cat([x, col_pad], dim=-1)
-        flat_x = x.view(B, n_heads, L, -1)
-        flat_pad = torch.zeros((B, n_heads, L, W-1), device=x.device, dtype=x.dtype)
-        flat_x_padded = torch.cat([flat_x, flat_pad], dim=-1)
-        final_x = flat_x_padded.view(B, n_heads, L, W+1, 2*W-1)
-        final_x = final_x[:, :, :, :W, W-1:]
-        return final_x
+        # print(f"x.shape before _rel_to_abs: {x.shape}")
+        # x: (batch, L, 2L-1)
+        batch, L, _ = x.shape
+        # Pad to shift from relative to absolute indexing
+        col_pad = torch.zeros((batch, L, 1), device=x.device, dtype=x.dtype)
+        x = torch.cat([x, col_pad], dim=2)  # (batch, L, 2L)        
+        flat_x = x.reshape(batch, -1)       # (batch, L*2L)
+        flat_pad = torch.zeros((batch, L-1), device=x.device, dtype=x.dtype)
+        flat_x_padded = torch.cat([flat_x, flat_pad], dim=1)  # (batch, L*2L + L-1)
+        # print(f"flat_x_padded.shape: {flat_x_padded.shape}, target: ({batch}, {L+1}, {2*L-1})")
+        final_x = flat_x_padded.reshape(batch, L+1, 2*L-1)
+        final_x = final_x[:, :L, L-1:]
+        return final_x  # (batch, L, L)
     
     def forward(self, x):
         B, C, H, W = x.shape
@@ -175,9 +191,10 @@ class SelfAttention2D(nn.Module):
         if self.relative:
             self._get_rel_embeddings(H, W, x.device)
             # Height
-            rel_logits_h = self._relative_logits_1d(q, self.rel_height, H, W, [0, 1, 4, 2, 5, 3])
+            rel_logits_h = self._relative_logits_1d(q, self.rel_height, H, W)
             # Width
-            rel_logits_w = self._relative_logits_1d(q.permute(0, 1, 4, 3, 2), self.rel_width, W, H, [0, 1, 3, 4, 2, 5])
+            rel_logits_w = self._relative_logits_1d(q.permute(0, 1, 3, 2, 4), self.rel_width, W, H)
+            # rel_logits_w = self._relative_logits_1d(q.permute(0, 1, 4, 3, 2), self.rel_width, W, H, [0, 1, 3, 4, 2, 5])
             attn_logits = attn_logits + rel_logits_h + rel_logits_w
 
         attn_weights = F.softmax(attn_logits, dim=-1)
