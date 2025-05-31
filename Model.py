@@ -125,10 +125,30 @@ class MEGClassifier(nn.Module):
                     results[f"{task}_recall"] = recall_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
                     results[f"{task}_precision"] = precision_score(y_true[mask], y_pred[mask], average='macro', zero_division=0)
         return results
+    
+def add_noise(data, noise_level=0.01):
+    """Add Gaussian noise to MEG data."""
+    noise = torch.randn_like(data) * noise_level
+    return data + noise
+
+def time_shift(data, max_shift=10):
+    """Randomly shift MEG data along the time axis."""
+    shift = np.random.randint(-max_shift, max_shift)
+    return torch.roll(data, shifts=shift, dims=-1)
+
+def amplitude_scale(data, scale_range=(0.9, 1.1)):
+    """Randomly scale amplitude of MEG data."""
+    scale = np.random.uniform(*scale_range)
+    return data * scale
+
+def channel_dropout(data, drop_prob=0.1):
+    """Randomly zero out some channels in MEG data."""
+    mask = (torch.rand(data.shape[-2]) > drop_prob).float()
+    return data * mask[None, :, None] if data.ndim == 3 else data * mask[:, None]
 
 
 class MultiviewDataset(torch.utils.data.Dataset):
-    def __init__(self, X, y, window_size, mesh_rows, mesh_columns, depth):
+    def __init__(self, X, y, window_size, mesh_rows, mesh_columns, depth, augment=False):
         """
         X: (N, C, T) torch.Tensor
         y: (N,) torch.Tensor
@@ -141,6 +161,7 @@ class MultiviewDataset(torch.utils.data.Dataset):
         self.mesh_rows = mesh_rows
         self.mesh_columns = mesh_columns
         self.depth = depth
+        self.augment = augment
 
         x_sample = self.X[0]  # shape: (C, T)
         T = x_sample.shape[1]
@@ -152,6 +173,18 @@ class MultiviewDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         x_sample = self.X[idx]  # shape: (C, T)
+
+        if self.augment:
+            # Randomly choose which augmentations to apply
+            if np.random.rand() < 0.7:
+                x_sample = add_noise(x_sample, noise_level=0.05)
+            if np.random.rand() < 0.7:
+                x_sample = time_shift(x_sample, max_shift=20)
+            if np.random.rand() < 0.5:
+                x_sample = amplitude_scale(x_sample, scale_range=(0.8, 1.2))
+            if np.random.rand() < 0.5:
+                x_sample = channel_dropout(x_sample, drop_prob=0.2)
+
         T = x_sample.shape[1]
         split_size = T // self.window_size
         if split_size != self.mesh_rows * self.mesh_columns:
@@ -454,6 +487,10 @@ class EEGNet(nn.Module):
         return x
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class SimpleAttention(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
@@ -465,7 +502,7 @@ class SimpleAttention(nn.Module):
         return (x * weights).sum(dim=1)  # (batch, input_dim)
 
 class MultiviewAttentionRef(nn.Module):
-    def __init__(self, window_size, depth, mesh_rows, mesh_columns, cnn_filters, lstm_hidden, dense_hidden, num_classes):
+    def __init__(self, window_size, depth, mesh_rows, mesh_columns, cnn_filters, lstm_hidden, dense_hidden, num_classes, dropout_rate=0.1):
         super().__init__()
         self.window_size = window_size
         self.depth = depth
@@ -475,43 +512,52 @@ class MultiviewAttentionRef(nn.Module):
         self.lstm_hidden = lstm_hidden
         self.dense_hidden = dense_hidden
         self.num_classes = num_classes
-        
-        self.cnn_branches = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(depth, cnn_filters, kernel_size=3, padding=1),
-                nn.BatchNorm2d(cnn_filters),
-                nn.ELU(),
-                nn.AdaptiveAvgPool2d((1, 1)),
-                nn.Flatten()
-            ) for _ in range(window_size)
-        ])
-        self.dense_branches = nn.ModuleList([
-            nn.Linear(cnn_filters, dense_hidden) for _ in range(window_size)
-        ])
-        self.lstm_branches = nn.ModuleList([
-            nn.LSTM(dense_hidden, lstm_hidden, batch_first=True) for _ in range(window_size)
-        ])
-        self.attn_branches = nn.ModuleList([
-            SimpleAttention(lstm_hidden) for _ in range(window_size)
-        ])
-        self.final_dense = nn.Sequential(
-            nn.Linear(window_size * lstm_hidden, 64),
+        self.dropout_rate = dropout_rate
+
+        # Shared CNN for all windows
+        self.cnn_branch = nn.Sequential(
+            nn.Conv2d(depth, cnn_filters, kernel_size=3, padding=1),
+            nn.BatchNorm2d(cnn_filters),
             nn.ELU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten()
+        )
+
+        # Shared Dense + Dropout
+        self.dense = nn.Sequential(
+            nn.Linear(cnn_filters, dense_hidden),
+            nn.ELU(),
+            nn.Dropout(dropout_rate)
+        )
+
+        # Shared LSTM + Attention
+        self.lstm = nn.LSTM(dense_hidden, lstm_hidden, batch_first=True, dropout=self.dropout_rate, num_layers=2)
+        # Attention mechanism
+        self.attn = SimpleAttention(lstm_hidden)
+
+        # Final classifier
+        self.final_dense = nn.Sequential(
+            nn.Linear(lstm_hidden, 64),
+            nn.ELU(),
+            nn.Dropout(dropout_rate),
             nn.Linear(64, num_classes)
         )
 
     def forward(self, x_cnn_list):
-        window_features = []
-        for i in range(self.window_size):
-            # Ensure each window is reshaped to (batch, depth, mesh_rows, mesh_columns)
-            x = x_cnn_list[i].reshape(-1, self.depth, self.mesh_rows, self.mesh_columns)
-            x = self.cnn_branches[i](x)  # (batch, cnn_filters)
-            x = self.dense_branches[i](x).unsqueeze(1)  # (batch, 1, dense_hidden)
-            lstm_out, _ = self.lstm_branches[i](x)  # (batch, 1, lstm_hidden)
-            attn_out = self.attn_branches[i](lstm_out)  # (batch, lstm_hidden)
-            window_features.append(attn_out)
-        features = torch.cat(window_features, dim=1)  # (batch, window_size * lstm_hidden)
-        return self.final_dense(features)
+        batch_size = x_cnn_list[0].size(0)
+        cnn_feats = []
+
+        for x in x_cnn_list:
+            x = x.reshape(batch_size, self.depth, self.mesh_rows, self.mesh_columns)
+            x = self.cnn_branch(x)  # (batch, cnn_filters)
+            x = self.dense(x)       # (batch, dense_hidden)
+            cnn_feats.append(x)
+
+        cnn_seq = torch.stack(cnn_feats, dim=1)  # (batch, window_size, dense_hidden)
+        lstm_out, _ = self.lstm(cnn_seq)         # (batch, window_size, lstm_hidden)
+        attn_out = self.attn(lstm_out)           # (batch, lstm_hidden)
+        attn_out = F.dropout(attn_out, p=self.dropout_rate, training=self.training)  # ✅ Additional regularization
+        return self.final_dense(attn_out)        # (batch, num_classes)
     
     def predict(self, loader, device):
         self.eval()

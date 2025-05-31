@@ -385,29 +385,23 @@ def create_metrics_df():
     return all_metrics_df
 
 
-# def single_train_epoch(model, train_loader, optimizer, criterion, device):
-#     model.train()
-#     train_preds, train_targets = [], []
-#     for x_batch, y_batch in train_loader:
-#         x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-#         optimizer.zero_grad()
-#         outputs = model(x_batch)
-#         loss = criterion(outputs, y_batch)
-#         loss.backward()
-#         optimizer.step()
-#         train_preds.extend(outputs.argmax(dim=1).detach().cpu().numpy())
-#         train_targets.extend(y_batch.detach().cpu().numpy())
-#     train_preds = np.array(train_preds)
-#     train_targets = np.array(train_targets)
+def get_mesh_candidates(split_size):
+    mesh_row_candidates = [r for r in range(5, min(50, split_size + 1)) if split_size % r == 0]
+    mesh_row_candidates.sort(key=lambda r: abs(r - (split_size / r)))
 
-#     return train_preds, train_targets
+    return mesh_row_candidates
+
+def get_mesh_candidate(split_size, mesh_rows_index=None):
+    mesh_row_candidates = get_mesh_candidates(split_size)
+
+    valid_index = mesh_rows_index is not None and mesh_rows_index > -1 and mesh_rows_index < len(mesh_row_candidates)
+    return mesh_row_candidates[mesh_rows_index] if valid_index else mesh_row_candidates[0]
 
 
 def train_full_model(
     study,
     train_data,
     train_df,
-    utils,
     device,
     epochs=100,
     verbose=True,
@@ -445,28 +439,28 @@ def train_full_model(
         best_params["split_size"] = T // best_params["window_size"] 
 
     if "mesh_rows" not in best_params and "mesh_rows_index" in best_params:
-        mesh_row_candidates = [r for r in range(5, min(50, best_params["split_size"] + 1)) if best_params["split_size"] % r == 0]
-        best_params["mesh_rows"] = mesh_row_candidates[best_params["mesh_rows_index"]]
+        best_params["mesh_rows"] =  get_mesh_candidate(split_size=best_params["split_size"], mesh_rows_index=best_params["mesh_rows_index"])
 
     if "mesh_columns" not in best_params:
         best_params["mesh_columns"] = best_params["split_size"] // best_params["mesh_rows"]
 
     # Instantiate model
-    best_model = utils.ModelClass(**{k: v for k, v in best_params.items() if k in utils.ModelClass.__init__.__code__.co_varnames}).to(device)
+    best_model = ModelClass(**{k: v for k, v in best_params.items() if k in ModelClass.__init__.__code__.co_varnames}).to(device)
 
     # Dataloader
-    if utils.ModelClass.__name__ in ["MultiviewAttention", "MultiviewAttentionRef"]:
-        train_loader = utils.get_multiview_dataloader(
+    if ModelClass.__name__ in ["MultiviewAttention", "MultiviewAttentionRef"]:
+        train_loader = get_multiview_dataloader(
             train_data, train_df,
             batch_size=best_params["batch_size"],
             window_size=best_params["window_size"],
             mesh_rows=best_params["mesh_rows"],
             mesh_columns=best_params["mesh_columns"],
             depth=best_params["depth"],
-            shuffle=True
+            shuffle=True,
+            augment=True
         )
     else:
-        train_loader, train_X, train_y = utils.get_dataloader(
+        train_loader, train_X, train_y = get_dataloader(
             data_tensor=train_data, df=train_df,
             batch_size=best_params["batch_size"],
             input_time_length=best_params.get("input_time_length", 256),
@@ -481,7 +475,7 @@ def train_full_model(
     learning_rate = best_params.get("learning_rate", 0.001)
     label_smoothing = best_params.get("label_smoothing", 0.1)
 
-    optimizer, scheduler, criterion = utils.get_training_parts(
+    optimizer, scheduler, criterion = get_training_parts(
         best_model, lr=learning_rate, max_epochs=epochs,
         optimizer_name=optimizer_name,
         weight_decay=weight_decay,
@@ -489,7 +483,7 @@ def train_full_model(
     )
 
     for epoch in range(epochs):
-        train_preds, train_targets, train_loss = utils.single_train_epoch(
+        train_preds, train_targets, train_loss = single_train_epoch(
             model=best_model, 
             train_loader=train_loader,
             optimizer=optimizer,
@@ -521,7 +515,7 @@ def train_full_model(
     ax2.tick_params(axis='y')
     ax2.legend(loc='upper right')
 
-    plt.title(f"Full Training Accuracy, F1 & Loss ({utils.ModelClass.__name__}) Total Train Acc: {total_train_acc:.4f}")
+    plt.title(f"Full Training Accuracy, F1 & Loss ({ModelClass.__name__}) Total Train Acc: {total_train_acc:.4f}")
     plt.grid(True)
     plt.savefig(path, bbox_inches='tight')
     plt.show()
@@ -613,10 +607,10 @@ def multiview_collate_fn(batch):
         y = torch.stack([sample[2] for sample in batch], dim=0)
         return x_cnn_list, x_lstm_list, y
 
-def get_multiview_dataloader(data_tensor, df, batch_size, window_size, mesh_rows, mesh_columns, depth, shuffle=False):
+def get_multiview_dataloader(data_tensor, df, batch_size, window_size, mesh_rows, mesh_columns, depth, shuffle=False, augment=False):
     y_full = df['task_type_cat'].values
     y = torch.tensor(y_full, dtype=torch.long)
-    dataset = MultiviewDataset(data_tensor, y, window_size, mesh_rows, mesh_columns, depth)
+    dataset = MultiviewDataset(data_tensor, y, window_size, mesh_rows, mesh_columns, depth, augment=augment)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=multiview_collate_fn)
     return loader
 
@@ -651,8 +645,8 @@ def get_multiview_dataloaders(
     y_train = torch.tensor(y_full[train_idx], dtype=torch.long)
     y_val = torch.tensor(y_full[val_idx], dtype=torch.long)
 
-    train_dataset = MultiviewDataset(data_tensor[train_idx], y_train, window_size, mesh_rows, mesh_columns, depth)
-    val_dataset = MultiviewDataset(data_tensor[val_idx], y_val, window_size, mesh_rows, mesh_columns, depth)
+    train_dataset = MultiviewDataset(data_tensor[train_idx], y_train, window_size, mesh_rows, mesh_columns, depth, augment=True)
+    val_dataset = MultiviewDataset(data_tensor[val_idx], y_val, window_size, mesh_rows, mesh_columns, depth, augment=False)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=multiview_collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=multiview_collate_fn)
@@ -842,33 +836,34 @@ def get_hyperparameter_search_space(trial, train_data):
         dict: A dictionary containing the hyperparameter search space.
     """
     if ModelClass == MultiviewAttentionRef:
-        window_size = trial.suggest_categorical('window_size', [4, 8])
+        window_size = trial.suggest_categorical('window_size', [10, 12, 14, 16, 18, 20])
         T = train_data.shape[2]
         split_size = T // window_size
 
-        mesh_row_candidates = [r for r in range(5, min(50, split_size + 1)) if split_size % r == 0]
+        mesh_row_candidates = get_mesh_candidates(split_size)
         if not mesh_row_candidates:
             raise optuna.TrialPruned(f"No valid mesh_rows for split_size={split_size}")
 
-        mesh_rows = mesh_row_candidates[trial.suggest_int('mesh_rows_index', 0, len(mesh_row_candidates) - 1)]
+        mesh_rows_index = trial.suggest_int('mesh_rows_index', 0, len(mesh_row_candidates) - 1)
+        mesh_rows = get_mesh_candidate(split_size=split_size, mesh_rows_index=mesh_rows_index)
         mesh_columns = split_size // mesh_rows
 
         hyperparams = {
             "window_size": window_size,
-            "cnn_filters": trial.suggest_categorical('cnn_filters', [32, 64, 128]),
-            "lstm_hidden": trial.suggest_categorical('lstm_hidden', [32, 64, 128]),
-            "dense_hidden": trial.suggest_categorical('dense_hidden', [32, 64, 128]),
+            "cnn_filters": trial.suggest_categorical('cnn_filters', [16, 32, 64, 128, 256]),
+            "lstm_hidden": trial.suggest_categorical('lstm_hidden', [32, 64, 96, 128]),
+            "dense_hidden": trial.suggest_categorical('dense_hidden', [32, 64, 96, 128]),
             "num_classes": len(np.unique(TASKS)),
             "depth": train_data.shape[1],
             "mesh_rows": mesh_rows,
             "mesh_columns": mesh_columns,
             "split_size": split_size,
-            "learning_rate": trial.suggest_float('learning_rate', 1e-4, 2e-3, log=True),
+            "learning_rate": trial.suggest_float('learning_rate', 1e-3, 2e-3, log=True),
             "batch_size": trial.suggest_categorical('batch_size', [4, 8, 16]),
-            "dropout_rate": trial.suggest_float('dropout_rate', 0.05, 0.2, step=0.05),
+            "dropout_rate": trial.suggest_float('dropout_rate', 0.3, 0.5, step=0.1),
             "optimizer": trial.suggest_categorical('optimizer', ['adam', 'adamw']),
-            "weight_decay": trial.suggest_float('weight_decay', 1e-8, 1e-3, log=True),
-            "label_smoothing": trial.suggest_float('label_smoothing', 0.0, 0.2, step=0.05),
+            "weight_decay": trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
+            "label_smoothing": trial.suggest_float("label_smoothing", 0.1, 0.3, step=0.05)
         }    
     
     elif ModelClass in [MultiviewAttention]:
@@ -877,7 +872,7 @@ def get_hyperparameter_search_space(trial, train_data):
         split_size = T // window_size
 
         # Find all possible (mesh_rows, mesh_columns) pairs for this split_size
-        mesh_row_candidates = [r for r in range(5, min(50, split_size + 1)) if split_size % r == 0]
+        mesh_row_candidates = get_mesh_candidates(split_size)
         if not mesh_row_candidates:
             raise optuna.TrialPruned(f"No valid mesh_rows for split_size={split_size}")
 
@@ -1004,9 +999,9 @@ def get_training_parts(model, lr=1e-3, weight_decay=1e-4, label_smoothing=0.1, m
     # Define your task names and desired weights
     task_weights_dict = {
         "resting": 1,
-        "math": 2,
-        "memory": 4,  # Give more weight to "memory"
-        "motor": 2
+        "math": 4,
+        "memory": 4, 
+        "motor": 4
     }
     # Make sure TASKS is in the same order as your class indices
     class_weights = torch.tensor([task_weights_dict[task] for task in TASKS], dtype=torch.float32).to(next(model.parameters()).device)
@@ -1065,7 +1060,7 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
         best_val_acc, updated_metrics_df, train_accs, val_accs_fold, train_losses, val_losses = train_model(
             model, train_loader, val_loader,
             attempt_index=trial_index,
-            epochs=200,
+            epochs=50,
             lr=hyperparams["learning_rate"],
             patience=10,
             device=device,

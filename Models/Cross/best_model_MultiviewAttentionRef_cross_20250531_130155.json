@@ -1,0 +1,20 @@
+{
+    "window_size": 4,
+    "mesh_rows_index": 1,
+    "cnn_filters": 32,
+    "lstm_hidden": 128,
+    "dense_hidden": 128,
+    "learning_rate": 0.0013379392229617443,
+    "batch_size": 16,
+    "dropout_rate": 0.30000000000000004,
+    "optimizer": "adamw",
+    "weight_decay": 4.820404390914542e-05,
+    "label_smoothing": 0.1,
+    "number_channels": 248,
+    "depth": 248,
+    "number_classes": 4,
+    "num_classes": 4,
+    "split_size": 1272,
+    "mesh_rows": 12,
+    "mesh_columns": 106
+}
