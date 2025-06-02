@@ -430,6 +430,8 @@ def train_full_model(
     best_params = best_trial.params.copy()
     best_params["number_channels"] = train_data.shape[1]
     best_params["depth"] = 1  # <-- set to 1 for new model
+    best_params["conv1_filters"] = 128  # <-- set to 1 for new model
+    best_params["conv2_filters"] = 256  # <-- set to 1 for new model
     best_params["number_classes"] = len(np.unique(train_df['task_type']))
     best_params["num_classes"] = len(np.unique(train_df['task_type']))
 
@@ -825,43 +827,37 @@ def compute_conv2d_output_size(H, W, kernel_size, padding, stride=1, dilation=1)
     out_w = (W + 2*padding - dilation*(kernel_size[1]-1) - 1)//stride + 1
     return out_h, out_w
 
-
-
 def get_hyperparameter_search_space(trial, train_data):
-    """
-    Define the hyperparameter search space for Optuna, using mesh_rows=8 and mesh_columns=31 for 248 channels.
-    """
     if ModelClass in [MultiviewAttention]:
-        window_size = trial.suggest_categorical('window_size', [4, 8])
+        window_size = trial.suggest_categorical('window_size', [16, 24, 32])
         T = train_data.shape[2]
         split_size = T // window_size
 
         ALL_KERNEL_SHAPES = [(3, 3), (5, 5)]
         ALL_PADDINGS = [1, 2]
 
-        # For 248 channels, depth=1, mesh_rows=8, mesh_columns=31 is correct
         depth = 1
         mesh_rows = 8
         mesh_columns = 31
 
         hyperparams = {
             "window_size": window_size,
-            "conv1_filters": trial.suggest_categorical('conv1_filters', [128]),
-            "conv2_filters": trial.suggest_categorical('conv2_filters', [256]),
-            "conv3_filters": trial.suggest_categorical('conv3_filters', [64, 256]),
+            "conv1_filters": 128,  # fixed, always best
+            "conv2_filters": 256,  # fixed, always best
+            "conv3_filters": trial.suggest_categorical('conv3_filters', [64, 128, 256]),
             "conv1_kernel_shape": trial.suggest_categorical('conv1_kernel_shape', ALL_KERNEL_SHAPES),
             "conv2_kernel_shape": trial.suggest_categorical('conv2_kernel_shape', ALL_KERNEL_SHAPES),
             "conv3_kernel_shape": trial.suggest_categorical('conv3_kernel_shape', ALL_KERNEL_SHAPES),
             "padding1": trial.suggest_categorical('padding1', ALL_PADDINGS),
             "padding2": trial.suggest_categorical('padding2', ALL_PADDINGS),
             "padding3": trial.suggest_categorical('padding3', ALL_PADDINGS),
-            "conv1_activation": trial.suggest_categorical('conv1_activation', ['leaky_relu', 'gelu']),
+            "conv1_activation": trial.suggest_categorical('conv1_activation', ['gelu', 'leaky_relu']),
             "conv2_activation": trial.suggest_categorical('conv2_activation', ['relu', 'leaky_relu']),
             "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'elu']),
             "dense_nodes": trial.suggest_categorical('dense_nodes', [128, 256]),
             "dense_activation": trial.suggest_categorical('dense_activation', ['relu', 'gelu']),
-            "depth": depth,# train_data.shape[1],
-            "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 128]),
+            "depth": depth,
+            "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 64]),
             "lstm2_cells": trial.suggest_categorical('lstm2_cells', [32, 64, 128]),
             "dense3_nodes": trial.suggest_categorical('dense3_nodes', [32, 64, 128]),
             "dense3_activation": trial.suggest_categorical('dense3_activation', ['relu', 'gelu']),
@@ -870,18 +866,15 @@ def get_hyperparameter_search_space(trial, train_data):
             "mesh_rows": mesh_rows,
             "mesh_columns": mesh_columns,
             "split_size": split_size,
-            "learning_rate": trial.suggest_float('learning_rate', 1e-4, 2e-3, log=True),
-            "batch_size": trial.suggest_categorical('batch_size', [4, 8, 16]),
+            "learning_rate": trial.suggest_float('learning_rate', 4e-4, 2e-3, log=True),
+            "batch_size": trial.suggest_categorical('batch_size', [4, 8, 16, 32]),
             "dropout_rate": trial.suggest_float('dropout_rate', 0.05, 0.15, step=0.05),
-            "optimizer": trial.suggest_categorical('optimizer', ['adam', 'adamw']),
-            "weight_decay": trial.suggest_float('weight_decay', 1e-8, 1e-3, log=True),
-            "label_smoothing": trial.suggest_float('label_smoothing', 0.0, 0.2, step=0.05),
-            "number_of_heads": trial.suggest_categorical('number_of_heads', [2, 3]),
-            "transformer_nhead": trial.suggest_categorical('transformer_nhead', [8, 16]),
-            "transformer_num_layers": trial.suggest_int('transformer_num_layers', 1, 3, step=1),
+            "optimizer": trial.suggest_categorical('optimizer', ['adam']),
+            "weight_decay": trial.suggest_float('weight_decay', 1e-7, 1e-4, log=True),
+            "label_smoothing": trial.suggest_float('label_smoothing', 0.05, 0.15, step=0.05),
+            "number_of_heads": trial.suggest_categorical('number_of_heads', [2, 4]),
         }
-
-        # Prune if any kernel shape or padding is invalid for the mesh size
+        # Pruning checks as before...
         for kernel_shape, padding, name in [
             (hyperparams["conv1_kernel_shape"], hyperparams["padding1"], "conv1"),
             (hyperparams["conv2_kernel_shape"], hyperparams["padding2"], "conv2"),
@@ -892,7 +885,6 @@ def get_hyperparameter_search_space(trial, train_data):
                     f"{name}: (mesh_rows + 2*padding)={mesh_rows + 2*padding}, (mesh_columns + 2*padding)={mesh_columns + 2*padding}, "
                     f"kernel_shape={kernel_shape} (padding={padding})"
                 )
-        # FINAL CHECK: ensure all kernel shapes fit input
         H, W = mesh_rows, mesh_columns
         for k, p, name in [
             (hyperparams["conv1_kernel_shape"], hyperparams["padding1"], "conv1"),
@@ -908,154 +900,7 @@ def get_hyperparameter_search_space(trial, train_data):
                 raise optuna.TrialPruned(
                     f"{name}: Output size ({H}, {W}) too small for next kernel {k}."
                 )
-    # elif ModelClass == MultiviewAttentionOriginal:
-    #     window_size = trial.suggest_categorical('window_size', [10, 12, 14, 16, 18, 20])
-    #     T = train_data.shape[2]
-    #     split_size = T // window_size
-
-    #     mesh_row_candidates = get_mesh_candidates(split_size)
-    #     if not mesh_row_candidates:
-    #         raise optuna.TrialPruned(f"No valid mesh_rows for split_size={split_size}")
-
-    #     mesh_rows_index = trial.suggest_int('mesh_rows_index', 0, len(mesh_row_candidates) - 1)
-    #     mesh_rows = get_mesh_candidate(split_size=split_size, mesh_rows_index=mesh_rows_index)
-    #     mesh_columns = split_size // mesh_rows
-
-    #     hyperparams = {
-    #         "window_size": window_size,
-    #         "cnn_filters": trial.suggest_categorical('cnn_filters', [16, 32, 64, 128, 256]),
-    #         "lstm_hidden": trial.suggest_categorical('lstm_hidden', [32, 64, 96, 128]),
-    #         "dense_hidden": trial.suggest_categorical('dense_hidden', [32, 64, 96, 128]),
-    #         "num_classes": len(np.unique(TASKS)),
-    #         "depth": train_data.shape[1],
-    #         "mesh_rows": mesh_rows,
-    #         "mesh_columns": mesh_columns,
-    #         "split_size": split_size,
-    #         "learning_rate": trial.suggest_float('learning_rate', 1e-3, 2e-3, log=True),
-    #         "batch_size": trial.suggest_categorical('batch_size', [4, 8, 16]),
-    #         "dropout_rate": trial.suggest_float('dropout_rate', 0.3, 0.5, step=0.1),
-    #         "optimizer": trial.suggest_categorical('optimizer', ['adam', 'adamw']),
-    #         "weight_decay": trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
-    #         "label_smoothing": trial.suggest_float("label_smoothing", 0.1, 0.3, step=0.05)
-    #     }    
-    
-    # elif ModelClass in [MultiviewAttention]:
-    #     window_size = trial.suggest_categorical('window_size', [4, 8])
-    #     T = train_data.shape[2]
-    #     split_size = T // window_size
-
-    #     # Find all possible (mesh_rows, mesh_columns) pairs for this split_size
-    #     mesh_row_candidates = get_mesh_candidates(split_size)
-    #     if not mesh_row_candidates:
-    #         raise optuna.TrialPruned(f"No valid mesh_rows for split_size={split_size}")
-
-    #     mesh_rows = mesh_row_candidates[trial.suggest_int('mesh_rows_index', 0, len(mesh_row_candidates) - 1)]
-    #     mesh_columns = split_size // mesh_rows
-
-    #     # --- FIX: Use fixed choices for Optuna, prune invalid combos after suggestion ---
-    #     ALL_KERNEL_SHAPES = [(3, 3), (5, 5)]
-    #     ALL_PADDINGS = [1, 2]
-
-    #     hyperparams = {
-    #         "window_size": window_size,
-    #         "conv1_filters": trial.suggest_categorical('conv1_filters', [128]),
-    #         "conv2_filters": trial.suggest_categorical('conv2_filters', [256]),
-    #         "conv3_filters": trial.suggest_categorical('conv3_filters', [64, 256]),
-    #         "conv1_kernel_shape": trial.suggest_categorical('conv1_kernel_shape', ALL_KERNEL_SHAPES),
-    #         "conv2_kernel_shape": trial.suggest_categorical('conv2_kernel_shape', ALL_KERNEL_SHAPES),
-    #         "conv3_kernel_shape": trial.suggest_categorical('conv3_kernel_shape', ALL_KERNEL_SHAPES),
-    #         "padding1": trial.suggest_categorical('padding1', ALL_PADDINGS),
-    #         "padding2": trial.suggest_categorical('padding2', ALL_PADDINGS),
-    #         "padding3": trial.suggest_categorical('padding3', ALL_PADDINGS),
-    #         "conv1_activation": trial.suggest_categorical('conv1_activation', ['leaky_relu', 'gelu']),
-    #         "conv2_activation": trial.suggest_categorical('conv2_activation', ['relu', 'leaky_relu']),
-    #         "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'elu']),
-    #         "dense_nodes": trial.suggest_categorical('dense_nodes', [128, 256]),
-    #         "dense_activation": trial.suggest_categorical('dense_activation', ['relu', 'gelu']),
-    #         "depth": trial.suggest_categorical('depth', [train_data.shape[1]]),
-    #         "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 128]),
-    #         "lstm2_cells": trial.suggest_categorical('lstm2_cells', [32, 64, 128]),
-    #         "dense3_nodes": trial.suggest_categorical('dense3_nodes', [32, 64, 128]),
-    #         "dense3_activation": trial.suggest_categorical('dense3_activation', ['relu', 'gelu']),
-    #         "number_classes": len(np.unique(TASKS)),
-    #         "number_channels": train_data.shape[1],
-    #         "mesh_rows": mesh_rows,
-    #         "mesh_columns": mesh_columns,
-    #         "split_size": split_size,
-    #         "learning_rate": trial.suggest_float('learning_rate', 1e-4, 2e-3, log=True),
-    #         "batch_size": trial.suggest_categorical('batch_size', [4, 8, 16]),
-    #         "dropout_rate": trial.suggest_float('dropout_rate', 0.05, 0.15, step=0.05),
-    #         "optimizer": trial.suggest_categorical('optimizer', ['adam', 'adamw']),
-    #         "weight_decay": trial.suggest_float('weight_decay', 1e-8, 1e-3, log=True),
-    #         "label_smoothing": trial.suggest_float('label_smoothing', 0.0, 0.2, step=0.05),
-    #         "transformer_nhead": trial.suggest_categorical('transformer_nhead', [8, 16]),
-    #         "transformer_num_layers": trial.suggest_int('transformer_num_layers', 1, 3, step=1),
-    #     }
-
-    #     # Prune if any kernel shape or padding is invalid for the mesh size
-    #     for kernel_shape, padding, name in [
-    #         (hyperparams["conv1_kernel_shape"], hyperparams["padding1"], "conv1"),
-    #         (hyperparams["conv2_kernel_shape"], hyperparams["padding2"], "conv2"),
-    #         (hyperparams["conv3_kernel_shape"], hyperparams["padding3"], "conv3"),
-    #     ]:
-    #         if (mesh_rows + 2 * padding) < kernel_shape[0] or (mesh_columns + 2 * padding) < kernel_shape[1]:
-    #             raise optuna.TrialPruned(
-    #                 f"{name}: (mesh_rows + 2*padding)={mesh_rows + 2*padding}, (mesh_columns + 2*padding)={mesh_columns + 2*padding}, "
-    #                 f"kernel_shape={kernel_shape} (padding={padding})"
-    #             )
-    #     # FINAL CHECK: ensure all kernel shapes fit input
-    #     for kernel_shape, padding, name in [
-    #         (hyperparams["conv1_kernel_shape"], hyperparams["padding1"], "conv1"),
-    #         (hyperparams["conv2_kernel_shape"], hyperparams["padding2"], "conv2"),
-    #         (hyperparams["conv3_kernel_shape"], hyperparams["padding3"], "conv3"),
-    #     ]:
-    #         effective_rows = mesh_rows + 2 * padding
-    #         effective_cols = mesh_columns + 2 * padding
-    #         if effective_rows < kernel_shape[0] or effective_cols < kernel_shape[1]:
-    #             raise optuna.TrialPruned(
-    #                 f"FINAL CHECK {name}: effective_rows={effective_rows}, effective_cols={effective_cols}, "
-    #                 f"kernel_shape={kernel_shape} (padding={padding})"
-    #             )
-            
-    #     # After you build hyperparams and before returning:
-    #     H, W = mesh_rows, mesh_columns
-    #     for i, (k, p, name) in enumerate([
-    #         (hyperparams["conv1_kernel_shape"], hyperparams["padding1"], "conv1"),
-    #         (hyperparams["conv2_kernel_shape"], hyperparams["padding2"], "conv2"),
-    #         (hyperparams["conv3_kernel_shape"], hyperparams["padding3"], "conv3"),
-    #     ]):
-    #         H, W = compute_conv2d_output_size(H, W, k, p)
-    #         if H < 1 or W < 1:
-    #             raise optuna.TrialPruned(
-    #                 f"{name}: Output size after conv would be ({H}, {W}) with kernel {k} and padding {p}."
-    #             )
-    #         if H < k[0] or W < k[1]:
-    #             raise optuna.TrialPruned(
-    #                 f"{name}: Output size ({H}, {W}) too small for next kernel {k}."
-    #             )
-    else:
-        hyperparams = {
-            "number_classes": train_data.shape[1],
-            "num_temporal_filters": trial.suggest_categorical('num_temporal_filters', [32, 64]),
-            "temporal_kernel_size": trial.suggest_categorical('temporal_kernel_size', [32, 64]),
-            "dropout_rate": trial.suggest_float('dropout_rate', 0.2, 0.6, step=0.1),
-            "activation": trial.suggest_categorical('activation', ['relu', 'gelu']),
-            "pool_size": trial.suggest_categorical('pool_size', [2, 4]),
-            "number_classes": len(np.unique(TASKS)),
-            "conv2d_channels": trial.suggest_categorical("conv2d_channels", ["32_64"]),
-            "transformer_d_model": trial.suggest_categorical('transformer_d_model', [128]),
-            "transformer_nhead": trial.suggest_categorical('transformer_nhead', [4]),
-            "transformer_dim_feedforward": trial.suggest_categorical('transformer_dim_feedforward', [128, 256]),
-            "transformer_layers": trial.suggest_int('transformer_layers', 1, 1),
-            "fc_hidden": trial.suggest_categorical('fc_hidden', [64, 128]),
-            "fc_dropout": trial.suggest_float('fc_dropout', 0.2, 0.6, step=0.1),
-            "learning_rate": trial.suggest_float('learning_rate', 1e-4, 5e-3, log=True),
-            "batch_size": trial.suggest_categorical('batch_size', [16, 32]),
-            "input_time_length": trial.suggest_categorical('input_time_length', [256, 512]),
-            "stride": trial.suggest_categorical('stride', [256, 512])
-        }
-
-    return hyperparams
+        return hyperparams
         
 def get_training_parts(model, lr=1e-3, weight_decay=1e-4, label_smoothing=0.1, max_epochs=100, optimizer_name="adam"):
     if optimizer_name == "adam":
@@ -1171,6 +1016,7 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
     mean_val_loss = np.nanmean(all_val_losses, axis=0)
 
     avg_val_acc = sum(val_accs) / len(val_accs)
+    avg_val_loss = sum(val_losses) / len(val_losses)
 
     plot_performance(
         mean_train_acc, mean_val_acc, mean_train_loss, mean_val_loss,
@@ -1178,7 +1024,7 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
         path=plot_path
     )
 
-    return avg_val_acc, all_metrics_df
+    return avg_val_acc, avg_val_loss, all_metrics_df
 
 
 def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64, input_time_length=256, stride=128, path=None):
