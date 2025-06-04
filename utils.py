@@ -796,6 +796,12 @@ def train_model(
                 torch.save(best_model_state, best_model_path)
         else:
             epochs_without_improvement += 1
+        
+        # --- NEW: Stop if perfect validation accuracy ---
+        if val_metrics["overall_accuracy"] >= 1.0:
+            print(f"Early stopping: Validation accuracy reached 1.0 at epoch {epoch+1}.")
+            break
+        
         if epochs_without_improvement >= patience:
             print(f"Early stopping triggered after {epoch + 1} epochs (no val_loss improvement).")
             break
@@ -854,7 +860,7 @@ def compute_conv2d_output_size(H, W, kernel_size, padding, stride=1, dilation=1)
 
 def get_hyperparameter_search_space(trial, train_data):
     if ModelClass in [MultiviewAttention]:
-        window_size = trial.suggest_categorical('window_size', [8, 16, 24, 32])
+        window_size = trial.suggest_categorical('window_size', [8, 16, 24])
         T = train_data.shape[2]
         split_size = T // window_size
 
@@ -879,7 +885,7 @@ def get_hyperparameter_search_space(trial, train_data):
             "conv1_activation": trial.suggest_categorical('conv1_activation', ['gelu', 'leaky_relu']),
             "conv2_activation": trial.suggest_categorical('conv2_activation', ['relu', 'leaky_relu']),
             "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'elu']),
-            "dense_nodes": trial.suggest_categorical('dense_nodes', [256, 512]),
+            "dense_nodes": trial.suggest_categorical('dense_nodes', [256]),
             "dense_activation": trial.suggest_categorical('dense_activation', ['relu', 'gelu']),
             "depth": depth,
             "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 64, 128]),

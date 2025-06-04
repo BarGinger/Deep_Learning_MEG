@@ -283,12 +283,15 @@ class MultiviewAttention(nn.Module):
         self.act_dense = activations.get(dense_activation.lower(), nn.ReLU())
         self.act_dense3 = activations.get(dense3_activation.lower(), nn.ReLU())
 
+        dk = max(4, number_of_heads * 2)  # or another multiple, but must be divisible by number_of_heads
+        dv = max(4, number_of_heads * 2)  # same logic
+
         # CNN branches
         self.cnn_branches = nn.ModuleList()
         self.cnn_dense = nn.ModuleList()
         for _ in range(window_size):
             branch = nn.Sequential(
-                AugmentedConv2D(depth, conv1_filters, conv1_kernel_shape, dk=6, dv=4, n_heads=2, relative=True),
+                AugmentedConv2D(depth, conv1_filters, conv1_kernel_shape, dk=dk, dv=dv, n_heads=number_of_heads, relative=True),
                 nn.BatchNorm2d(conv1_filters),
                 self.act1,
                 nn.Conv2d(conv1_filters, conv2_filters, kernel_size=conv2_kernel_shape, padding=padding2),
