@@ -405,19 +405,24 @@ def train_full_model(
     device,
     epochs=100,
     verbose=True,
-    path="full_training_curves.png"
+    path="full_training_curves.png",
+    patience=10,
+    min_delta=1e-4
 ):
     """
     Trains the best model found by Optuna on the full training set and plots training curves.
+    Adds early stopping based on training loss.
 
     Args:
         study: Optuna study object after optimization.
         train_data: Training data (numpy array or tensor).
         train_df: Training DataFrame with labels.
-        utils: Module with ModelClass, dataloader, and training utilities.
         device: Torch device.
         epochs: Number of epochs to train.
         verbose: Print progress if True.
+        path: Path to save the training curves plot.
+        patience: Number of epochs with no improvement to wait before stopping.
+        min_delta: Minimum change to qualify as an improvement.
 
     Returns:
         best_model: Trained model.
@@ -484,7 +489,11 @@ def train_full_model(
         label_smoothing=label_smoothing
     )
 
-    for epoch in range(epochs):
+    best_train_loss = float('inf')
+    epochs_without_improvement = 0
+
+    epochs_pbar = tqdm(range(epochs), desc="Full Training", unit="epoch")
+    for epoch in epochs_pbar:
         train_preds, train_targets, train_loss = single_train_epoch(
             model=best_model, 
             train_loader=train_loader,
@@ -497,8 +506,24 @@ def train_full_model(
         train_f1s.append(train_metrics["overall_F1"])
         train_losses.append(train_loss)
         scheduler.step()
-        if verbose and (epoch % 10 == 0 or epoch == epochs-1):
-            print(f"Epoch {epoch+1}/{epochs} - Acc: {train_accs[-1]:.4f} - F1: {train_f1s[-1]:.4f} - Loss: {train_losses[-1]:.4f}")
+
+        # Update progress bar
+        epochs_pbar.set_postfix(
+            accuracy=train_metrics["overall_accuracy"],
+            F1=train_metrics["overall_F1"],
+            loss=train_loss
+        )
+        
+
+        # Early stopping logic (on training loss)
+        if train_loss < best_train_loss - min_delta:
+            best_train_loss = train_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+        if epochs_without_improvement >= patience:
+            print(f"Early stopping triggered after {epoch+1} epochs (no train_loss improvement).")
+            break
 
     total_train_acc = np.mean(train_accs)
     print(f"Total Train Accuracy: {total_train_acc:.4f}")
@@ -829,7 +854,7 @@ def compute_conv2d_output_size(H, W, kernel_size, padding, stride=1, dilation=1)
 
 def get_hyperparameter_search_space(trial, train_data):
     if ModelClass in [MultiviewAttention]:
-        window_size = trial.suggest_categorical('window_size', [16, 24, 32])
+        window_size = trial.suggest_categorical('window_size', [8, 16, 24, 32])
         T = train_data.shape[2]
         split_size = T // window_size
 
@@ -844,7 +869,7 @@ def get_hyperparameter_search_space(trial, train_data):
             "window_size": window_size,
             "conv1_filters": 128,  # fixed, always best
             "conv2_filters": 256,  # fixed, always best
-            "conv3_filters": trial.suggest_categorical('conv3_filters', [64, 128, 256]),
+            "conv3_filters": trial.suggest_categorical('conv3_filters', [128, 256]),
             "conv1_kernel_shape": trial.suggest_categorical('conv1_kernel_shape', ALL_KERNEL_SHAPES),
             "conv2_kernel_shape": trial.suggest_categorical('conv2_kernel_shape', ALL_KERNEL_SHAPES),
             "conv3_kernel_shape": trial.suggest_categorical('conv3_kernel_shape', ALL_KERNEL_SHAPES),
@@ -854,10 +879,10 @@ def get_hyperparameter_search_space(trial, train_data):
             "conv1_activation": trial.suggest_categorical('conv1_activation', ['gelu', 'leaky_relu']),
             "conv2_activation": trial.suggest_categorical('conv2_activation', ['relu', 'leaky_relu']),
             "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'elu']),
-            "dense_nodes": trial.suggest_categorical('dense_nodes', [128, 256]),
+            "dense_nodes": trial.suggest_categorical('dense_nodes', [256, 512]),
             "dense_activation": trial.suggest_categorical('dense_activation', ['relu', 'gelu']),
             "depth": depth,
-            "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 64]),
+            "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 64, 128]),
             "lstm2_cells": trial.suggest_categorical('lstm2_cells', [32, 64, 128]),
             "dense3_nodes": trial.suggest_categorical('dense3_nodes', [32, 64, 128]),
             "dense3_activation": trial.suggest_categorical('dense3_activation', ['relu', 'gelu']),
@@ -867,9 +892,9 @@ def get_hyperparameter_search_space(trial, train_data):
             "mesh_columns": mesh_columns,
             "split_size": split_size,
             "learning_rate": trial.suggest_float('learning_rate', 4e-4, 2e-3, log=True),
-            "batch_size": trial.suggest_categorical('batch_size', [4, 8, 16, 32]),
-            "dropout_rate": trial.suggest_float('dropout_rate', 0.05, 0.15, step=0.05),
-            "optimizer": trial.suggest_categorical('optimizer', ['adam']),
+            "batch_size": trial.suggest_categorical('batch_size', [2, 4, 8, 16]),
+            "dropout_rate": trial.suggest_float('dropout_rate', 0.1, 0.25, step=0.05),
+            "optimizer": trial.suggest_categorical('optimizer', ['adam', 'adamw', 'rmsprop']),
             "weight_decay": trial.suggest_float('weight_decay', 1e-7, 1e-4, log=True),
             "label_smoothing": trial.suggest_float('label_smoothing', 0.05, 0.15, step=0.05),
             "number_of_heads": trial.suggest_categorical('number_of_heads', [2, 4]),
@@ -978,7 +1003,7 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
         best_val_acc, updated_metrics_df, train_accs, val_accs_fold, train_losses, val_losses = train_model(
             model, train_loader, val_loader,
             attempt_index=trial_index,
-            epochs=50,
+            epochs=30,
             lr=hyperparams["learning_rate"],
             patience=10,
             device=device,
