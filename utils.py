@@ -860,7 +860,7 @@ def compute_conv2d_output_size(H, W, kernel_size, padding, stride=1, dilation=1)
 
 def get_hyperparameter_search_space(trial, train_data):
     if ModelClass in [MultiviewAttention]:
-        window_size = trial.suggest_categorical('window_size', [8, 16, 24])
+        window_size = trial.suggest_categorical('window_size', [8, 16, 18])
         T = train_data.shape[2]
         split_size = T // window_size
 
@@ -961,101 +961,110 @@ def get_training_parts(model, lr=1e-3, weight_decay=1e-4, label_smoothing=0.1, m
 
 def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, best_model_path=None,
               plot_path=None, property_to_split_on='task_type_cat'):
-    # Define hyperparameters using trial
-    hyperparams = get_hyperparameter_search_space(trial, train_data)
+    try:
+        # Define hyperparameters using trial
+        hyperparams = get_hyperparameter_search_space(trial, train_data)
 
-    all_train_accs = []
-    all_val_accs = []
-    all_train_losses = []
-    all_val_losses = []
-    val_accs = []
+        all_train_accs = []
+        all_val_accs = []
+        all_train_losses = []
+        all_val_losses = []
+        val_accs = []
 
-    for fold_idx in range(n_splits):
-        if ModelClass in [MultiviewAttention]:
-            train_loader, val_loader, train_df2, val_df2 = get_multiview_dataloaders(
-                train_data, train_df,
-                fold_index=fold_idx,
-                n_splits=n_splits,
-                batch_size=hyperparams["batch_size"],
-                window_size=hyperparams["window_size"],
-                mesh_rows=hyperparams["mesh_rows"],
-                mesh_columns=hyperparams["mesh_columns"],
-                depth=hyperparams["depth"],
-                property_to_split_on=property_to_split_on
-            )
+        for fold_idx in range(n_splits):
+            if ModelClass in [MultiviewAttention]:
+                train_loader, val_loader, train_df2, val_df2 = get_multiview_dataloaders(
+                    train_data, train_df,
+                    fold_index=fold_idx,
+                    n_splits=n_splits,
+                    batch_size=hyperparams["batch_size"],
+                    window_size=hyperparams["window_size"],
+                    mesh_rows=hyperparams["mesh_rows"],
+                    mesh_columns=hyperparams["mesh_columns"],
+                    depth=hyperparams["depth"],
+                    property_to_split_on=property_to_split_on
+                )
+            else:
+                train_loader, val_loader, train_df2, val_df2 = get_dataloaders(
+                    data_tensor=train_data,
+                    df=train_df,
+                    fold_index=fold_idx,
+                    n_splits=n_splits,
+                    batch_size=hyperparams["batch_size"]
+                )
+
+            if debug_mode:
+                print(f"Fold {fold_idx + 1}/{n_splits} - Hyperparameters: {hyperparams}")
+                print("train task types counts:")
+                print(np.bincount(train_df2['task_type'].astype('category').cat.codes))
+                print("validation task types counts:")
+                print(np.bincount(val_df2['task_type'].astype('category').cat.codes))
+
+                print("Train patient_id counts:\n", train_df2["patient_id"].value_counts())
+                print("Val patient_id counts:\n", val_df2["patient_id"].value_counts())
+
+            model = ModelClass(**{k: v for k, v in hyperparams.items() if k in ModelClass.__init__.__code__.co_varnames}).to(device)
+
+            trial_index = trial.number + 1
+
+            best_val_acc, updated_metrics_df, train_accs, val_accs_fold, train_losses, val_losses = train_model(
+                model, train_loader, val_loader,
+                attempt_index=trial_index,
+                epochs=30,
+                lr=hyperparams["learning_rate"],
+                patience=10,
+                device=device,
+                all_metrics_df=all_metrics_df,
+                hyperparams=hyperparams,
+                task_names=TASKS,
+                fold_idx=fold_idx,
+                best_model_path=best_model_path,
+                min_delta=1e-3
+            )      
+
+            val_accs.append(best_val_acc)
+            all_metrics_df = updated_metrics_df  # accumulate across folds
+
+            all_train_accs.append(train_accs)
+            all_val_accs.append(val_accs_fold)
+            all_train_losses.append(train_losses)
+            all_val_losses.append(val_losses)
+
+        # Compute means across folds
+        # Find the maximum number of epochs across all folds
+        max_len = max(len(x) for x in all_train_accs)
+
+        def pad_to_max(arrays, fill_value=np.nan):
+            return [np.pad(a, (0, max_len - len(a)), constant_values=fill_value) for a in arrays]
+
+        all_train_accs = pad_to_max(all_train_accs)
+        all_val_accs = pad_to_max(all_val_accs)
+        all_train_losses = pad_to_max(all_train_losses)
+        all_val_losses = pad_to_max(all_val_losses)
+
+        mean_train_acc = np.nanmean(all_train_accs, axis=0)
+        mean_val_acc = np.nanmean(all_val_accs, axis=0)
+        mean_train_loss = np.nanmean(all_train_losses, axis=0)
+        mean_val_loss = np.nanmean(all_val_losses, axis=0)
+
+        avg_val_acc = sum(val_accs) / len(val_accs)
+        avg_val_loss = sum(val_losses) / len(val_losses)
+
+        plot_performance(
+            mean_train_acc, mean_val_acc, mean_train_loss, mean_val_loss,
+            trail_index=trial_index,
+            path=plot_path
+        )
+
+        return avg_val_acc, avg_val_loss, all_metrics_df
+
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            print(f"Trial pruned due to CUDA OOM: {e}")
+            torch.cuda.empty_cache()
+            raise optuna.TrialPruned()
         else:
-            train_loader, val_loader, train_df2, val_df2 = get_dataloaders(
-                data_tensor=train_data,
-                df=train_df,
-                fold_index=fold_idx,
-                n_splits=n_splits,
-                batch_size=hyperparams["batch_size"]
-            )
-
-        if debug_mode:
-            print(f"Fold {fold_idx + 1}/{n_splits} - Hyperparameters: {hyperparams}")
-            print("train task types counts:")
-            print(np.bincount(train_df2['task_type'].astype('category').cat.codes))
-            print("validation task types counts:")
-            print(np.bincount(val_df2['task_type'].astype('category').cat.codes))
-
-            print("Train patient_id counts:\n", train_df2["patient_id"].value_counts())
-            print("Val patient_id counts:\n", val_df2["patient_id"].value_counts())
-
-        model = ModelClass(**{k: v for k, v in hyperparams.items() if k in ModelClass.__init__.__code__.co_varnames}).to(device)
-
-        trial_index = trial.number + 1
-
-        best_val_acc, updated_metrics_df, train_accs, val_accs_fold, train_losses, val_losses = train_model(
-            model, train_loader, val_loader,
-            attempt_index=trial_index,
-            epochs=30,
-            lr=hyperparams["learning_rate"],
-            patience=10,
-            device=device,
-            all_metrics_df=all_metrics_df,
-            hyperparams=hyperparams,
-            task_names=TASKS,
-            fold_idx=fold_idx,
-            best_model_path=best_model_path,
-            min_delta=1e-3
-        )      
-
-        val_accs.append(best_val_acc)
-        all_metrics_df = updated_metrics_df  # accumulate across folds
-
-        all_train_accs.append(train_accs)
-        all_val_accs.append(val_accs_fold)
-        all_train_losses.append(train_losses)
-        all_val_losses.append(val_losses)
-
-    # Compute means across folds
-    # Find the maximum number of epochs across all folds
-    max_len = max(len(x) for x in all_train_accs)
-
-    def pad_to_max(arrays, fill_value=np.nan):
-        return [np.pad(a, (0, max_len - len(a)), constant_values=fill_value) for a in arrays]
-
-    all_train_accs = pad_to_max(all_train_accs)
-    all_val_accs = pad_to_max(all_val_accs)
-    all_train_losses = pad_to_max(all_train_losses)
-    all_val_losses = pad_to_max(all_val_losses)
-
-    mean_train_acc = np.nanmean(all_train_accs, axis=0)
-    mean_val_acc = np.nanmean(all_val_accs, axis=0)
-    mean_train_loss = np.nanmean(all_train_losses, axis=0)
-    mean_val_loss = np.nanmean(all_val_losses, axis=0)
-
-    avg_val_acc = sum(val_accs) / len(val_accs)
-    avg_val_loss = sum(val_losses) / len(val_losses)
-
-    plot_performance(
-        mean_train_acc, mean_val_acc, mean_train_loss, mean_val_loss,
-        trail_index=trial_index,
-        path=plot_path
-    )
-
-    return avg_val_acc, avg_val_loss, all_metrics_df
+            raise
 
 
 def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64, input_time_length=256, stride=128, path=None):
