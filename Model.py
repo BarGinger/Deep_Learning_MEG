@@ -253,7 +253,7 @@ class MultiviewAttention(nn.Module):
         dense_activation,
         depth,
         lstm1_cells,
-        lstm2_cells,
+        lstm2_cells,        
         dense3_nodes,
         dense3_activation,
         number_channels,
@@ -261,6 +261,9 @@ class MultiviewAttention(nn.Module):
         mesh_rows,
         mesh_columns,
         number_classes,
+        lstm1_layers=1,
+        lstm2_layers=1,
+        dropout_rate=0.1,
     ):
         super().__init__()
         self.window_size = window_size
@@ -269,6 +272,8 @@ class MultiviewAttention(nn.Module):
         self.mesh_rows = mesh_rows
         self.mesh_columns = mesh_columns
         self.number_classes = number_classes
+        self.lstm1_layers = lstm1_layers
+        self.lstm2_layers = lstm2_layers
 
         activations = {
             'relu': nn.ReLU(),
@@ -282,6 +287,7 @@ class MultiviewAttention(nn.Module):
         self.act3 = activations.get(conv3_activation.lower(), nn.ReLU())
         self.act_dense = activations.get(dense_activation.lower(), nn.ReLU())
         self.act_dense3 = activations.get(dense3_activation.lower(), nn.ReLU())
+        self.dropout_rate = dropout_rate
 
         dk = max(4, number_of_heads * 2)  # or another multiple, but must be divisible by number_of_heads
         dv = max(4, number_of_heads * 2)  # same logic
@@ -294,6 +300,7 @@ class MultiviewAttention(nn.Module):
                 AugmentedConv2D(depth, conv1_filters, conv1_kernel_shape, dk=dk, dv=dv, n_heads=number_of_heads, relative=True),
                 nn.BatchNorm2d(conv1_filters),
                 self.act1,
+                nn.Dropout(dropout_rate),  # Add dropout here
                 nn.Conv2d(conv1_filters, conv2_filters, kernel_size=conv2_kernel_shape, padding=padding2),
                 self.act2,
                 nn.Conv2d(conv2_filters, conv3_filters, kernel_size=conv3_kernel_shape, padding=padding3),
@@ -305,10 +312,12 @@ class MultiviewAttention(nn.Module):
             with torch.no_grad():
                 dummy = torch.zeros(1, depth, mesh_rows, mesh_columns)
                 flat_size = branch(dummy).shape[1]
+
             self.cnn_dense.append(
                 nn.Sequential(
                     nn.Linear(flat_size, dense_nodes),
-                    self.act_dense
+                    self.act_dense,
+                    nn.Dropout(dropout_rate)  # Add dropout here
                 )
             )
 
@@ -319,15 +328,19 @@ class MultiviewAttention(nn.Module):
                 self.act_dense
             ) for _ in range(window_size)
         ])
-        self.lstm1 = nn.LSTM(dense_nodes, lstm1_cells, batch_first=True)
-        self.lstm2 = nn.LSTM(lstm1_cells, lstm2_cells, batch_first=True)
+        self.lstm1 = nn.LSTM(dense_nodes, lstm1_cells, batch_first=True, bidirectional=True, num_layers=lstm1_layers, dropout=dropout_rate)
+        self.lstm2 = nn.LSTM(2 * lstm1_cells, lstm2_cells, batch_first=True, bidirectional=True,  num_layers=lstm2_layers,  dropout=dropout_rate)
         self.final_dense = nn.Sequential(
-            nn.Linear(lstm2_cells, dense3_nodes),
-            self.act_dense3
+            nn.Linear(2 * lstm2_cells, dense3_nodes),
+            self.act_dense3,
+            nn.Dropout(dropout_rate)  # Add dropout here
         )
 
         # Final classifier
-        self.classifier = nn.Linear(dense3_nodes + dense_nodes, number_classes)
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(dense3_nodes + dense_nodes, number_classes)
+        )
         self.tasks = ["resting", "math", "memory", "motor"]
 
     def forward(self, x_cnn_list, x_lstm_list):

@@ -39,7 +39,7 @@ from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.model_selection import StratifiedKFold
 import matplotlib.pyplot as plt
 from sklearn.model_selection import GroupKFold
-
+from scipy.signal import butter, filtfilt
 
 # Gloval variables
 debug_mode = False  # controls whether to print debug information
@@ -80,6 +80,23 @@ def get_dataset_from_h5py(filename_path):
         print(f"An error occurred: {e}")
 
     return matrix
+
+def lowpass_filter(data, cutoff=40, fs=250, order=4):
+    """
+    Apply a low-pass Butterworth filter to the last dimension (time) of the data.
+    Args:
+        data: torch.Tensor or np.ndarray, shape (..., T)
+        cutoff: cutoff frequency in Hz
+        fs: sampling frequency in Hz
+        order: filter order
+    Returns:
+        Filtered data, same shape as input
+    """
+    b, a = butter(order, cutoff / (0.5 * fs), btype='low')
+    data_np = data.numpy() if isinstance(data, torch.Tensor) else data
+    filtered = filtfilt(b, a, data_np, axis=-1)
+    filtered = filtered.copy()  # <-- Fix: ensure positive strides
+    return torch.tensor(filtered, dtype=torch.float32) if isinstance(data, torch.Tensor) else filtered
 
 def load_dataset(which_dataset="intra", data_dir="./Data", scaler_type="Z_SCORE_LOCAL", downsample_rate=0):
     ## load the chosen dataset/s
@@ -153,6 +170,9 @@ def load_eeg_data_and_metadata(folder_path, split):
         trial = m.group("trial")
         dataset = get_dataset_from_h5py(file_path)
         if dataset is not None:
+            # Apply low-pass filter here
+            dataset = lowpass_filter(dataset, cutoff=40, fs=250, order=4)
+            # Ensure dataset is 3D (N, C, T) and convert to float32
             data.append(torch.tensor(dataset, dtype=torch.float32))
             meta.append({
                 "filename": os.path.basename(file_path),
@@ -434,11 +454,18 @@ def train_full_model(
     best_trial = study.best_trial
     best_params = best_trial.params.copy()
     best_params["number_channels"] = train_data.shape[1]
-    best_params["depth"] = 1  # <-- set to 1 for new model
-    best_params["conv1_filters"] = 128  # <-- set to 1 for new model
-    best_params["conv2_filters"] = 256  # <-- set to 1 for new model
-    best_params["number_classes"] = len(np.unique(train_df['task_type']))
-    best_params["num_classes"] = len(np.unique(train_df['task_type']))
+    if "depth" not in best_params:
+         best_params["depth"] = 1  # <-- set to 1 for new model
+    if "conv1_filters" not in best_params:
+        best_params["conv1_filters"] = 128  # <-- set to 1 for new model
+    if "conv2_filters" not in best_params:
+        best_params["conv2_filters"] = 256  # <-- set to 1 for new model
+
+    if "number_classes" not in best_params:
+        best_params["number_classes"] = len(np.unique(train_df['task_type']))
+    
+    if "num_classes" not in best_params:
+        best_params["num_classes"] = len(np.unique(train_df['task_type']))
 
     # Recompute split_size if missing
     if "split_size" not in best_params:
@@ -524,8 +551,11 @@ def train_full_model(
         if epochs_without_improvement >= patience:
             print(f"Early stopping triggered after {epoch+1} epochs (no train_loss improvement).")
             break
+        if train_metrics["overall_accuracy"] > 0.98:
+            print(f"Early stopping triggered after {epoch+1} epochs (train_accuracy > 0.95).")
+            break
 
-    total_train_acc = np.mean(train_accs)
+    total_train_acc = train_accs[len(train_accs) - 1] if train_accs else 0.0
     print(f"Total Train Accuracy: {total_train_acc:.4f}")
 
     fig, ax1 = plt.subplots(figsize=(10, 5))
@@ -858,18 +888,37 @@ def compute_conv2d_output_size(H, W, kernel_size, padding, stride=1, dilation=1)
     out_w = (W + 2*padding - dilation*(kernel_size[1]-1) - 1)//stride + 1
     return out_h, out_w
 
+# Precompute all valid (depth, mesh_rows, mesh_columns) combinations
+def get_all_mesh_combinations(number_channels):
+    combos = []
+    for depth in [1, 2, 4, 8, 10]:
+        for mesh_rows in range(5, number_channels + 1):  # start at 5
+            if number_channels % (depth * mesh_rows) == 0:
+                mesh_columns = number_channels // (depth * mesh_rows)
+                # Only allow mesh_columns >= 5 and aspect ratio between 0.5 and 2
+                if mesh_columns >= 5 and 0.5 <= mesh_rows / mesh_columns <= 2:
+                    combos.append((depth, mesh_rows, mesh_columns))
+    print(f"Generated {len(combos)} mesh combos for {number_channels} channels: {combos}")
+    return combos
+
+ALL_MESH_COMBOS = get_all_mesh_combinations(number_channels=248)
+
 def get_hyperparameter_search_space(trial, train_data):
     if ModelClass in [MultiviewAttention]:
-        window_size = trial.suggest_categorical('window_size', [8, 16, 18])
+        window_size = trial.suggest_categorical('window_size', [8, 16, 24, 32, 48, 50])
         T = train_data.shape[2]
         split_size = T // window_size
 
-        ALL_KERNEL_SHAPES = [(3, 3), (5, 5)]
-        ALL_PADDINGS = [1, 2]
+        ALL_KERNEL_SHAPES = [(3, 3)]
+        ALL_PADDINGS = [0, 1, 2]
 
         depth = 1
         mesh_rows = 8
         mesh_columns = 31
+
+        number_channels = train_data.shape[1]
+        # depth, mesh_rows, mesh_columns = trial.suggest_categorical('mesh_combo', ALL_MESH_COMBOS)      
+
 
         hyperparams = {
             "window_size": window_size,
@@ -882,28 +931,30 @@ def get_hyperparameter_search_space(trial, train_data):
             "padding1": trial.suggest_categorical('padding1', ALL_PADDINGS),
             "padding2": trial.suggest_categorical('padding2', ALL_PADDINGS),
             "padding3": trial.suggest_categorical('padding3', ALL_PADDINGS),
-            "conv1_activation": trial.suggest_categorical('conv1_activation', ['gelu', 'leaky_relu']),
-            "conv2_activation": trial.suggest_categorical('conv2_activation', ['relu', 'leaky_relu']),
-            "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'elu']),
+            "conv1_activation": trial.suggest_categorical('conv1_activation', ['relu', 'gelu', 'leaky_relu']),
+            "conv2_activation": trial.suggest_categorical('conv2_activation', ['relu', 'gelu', 'leaky_relu']),
+            "conv3_activation": trial.suggest_categorical('conv3_activation', ['relu', 'gelu', 'leaky_relu']),
             "dense_nodes": trial.suggest_categorical('dense_nodes', [256]),
-            "dense_activation": trial.suggest_categorical('dense_activation', ['relu', 'gelu']),
+            "dense_activation": trial.suggest_categorical('dense_activation', ['relu', 'gelu', 'leaky_relu']),
             "depth": depth,
             "lstm1_cells": trial.suggest_categorical('lstm1_cells', [32, 64, 128]),
             "lstm2_cells": trial.suggest_categorical('lstm2_cells', [32, 64, 128]),
+            "lstm1_layers": trial.suggest_categorical('lstm1_layers', [1, 2]),
+            "lstm2_layers": trial.suggest_categorical('lstm2_layers', [1, 2]),
             "dense3_nodes": trial.suggest_categorical('dense3_nodes', [32, 64, 128]),
-            "dense3_activation": trial.suggest_categorical('dense3_activation', ['relu', 'gelu']),
+            "dense3_activation": trial.suggest_categorical('dense3_activation', ['relu', 'gelu', 'leaky_relu']),
             "number_classes": len(np.unique(TASKS)),
-            "number_channels": train_data.shape[1],
+            "number_channels": number_channels,
             "mesh_rows": mesh_rows,
             "mesh_columns": mesh_columns,
             "split_size": split_size,
             "learning_rate": trial.suggest_float('learning_rate', 4e-4, 2e-3, log=True),
-            "batch_size": trial.suggest_categorical('batch_size', [2, 4, 8, 16]),
+            "batch_size": trial.suggest_categorical('batch_size', [2, 8, 16, 32]),
             "dropout_rate": trial.suggest_float('dropout_rate', 0.1, 0.25, step=0.05),
             "optimizer": trial.suggest_categorical('optimizer', ['adam', 'adamw', 'rmsprop']),
             "weight_decay": trial.suggest_float('weight_decay', 1e-7, 1e-4, log=True),
             "label_smoothing": trial.suggest_float('label_smoothing', 0.05, 0.15, step=0.05),
-            "number_of_heads": trial.suggest_categorical('number_of_heads', [2, 4]),
+            "number_of_heads": trial.suggest_categorical('number_of_heads', [2, 3, 4, 6, 8]),
         }
         # Pruning checks as before...
         for kernel_shape, padding, name in [
@@ -960,7 +1011,7 @@ def get_training_parts(model, lr=1e-3, weight_decay=1e-4, label_smoothing=0.1, m
 
 
 def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, best_model_path=None,
-              plot_path=None, property_to_split_on='task_type_cat'):
+              plot_path=None, property_to_split_on='task_type_cat', model_csv_path=None):
     try:
         # Define hyperparameters using trial
         hyperparams = get_hyperparameter_search_space(trial, train_data)
@@ -1031,7 +1082,6 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
             all_val_losses.append(val_losses)
 
         # Compute means across folds
-        # Find the maximum number of epochs across all folds
         max_len = max(len(x) for x in all_train_accs)
 
         def pad_to_max(arrays, fill_value=np.nan):
@@ -1056,14 +1106,26 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
             path=plot_path
         )
 
+        # --- Save metrics after each trial ---
+        if model_csv_path is not None:
+            all_metrics_df.to_csv(model_csv_path, index=False)
+            if debug_mode:
+                print(f"Saved all_metrics_df to {model_csv_path} after trial {trial.number}")
+
         return avg_val_acc, avg_val_loss, all_metrics_df
 
     except RuntimeError as e:
         if "out of memory" in str(e):
             print(f"Trial pruned due to CUDA OOM: {e}")
             torch.cuda.empty_cache()
+            # Save metrics even if pruned
+            if model_csv_path is not None:
+                all_metrics_df.to_csv(model_csv_path, index=False)
             raise optuna.TrialPruned()
         else:
+            # Save metrics on other errors too
+            if model_csv_path is not None:
+                all_metrics_df.to_csv(model_csv_path, index=False)
             raise
 
 

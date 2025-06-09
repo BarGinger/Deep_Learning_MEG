@@ -1,0 +1,2 @@
+overall_accuracy,overall_F1,overall_recall,overall_precision,resting_accuracy,resting_F1,resting_recall,resting_precision,math_accuracy,math_F1,math_recall,math_precision,memory_accuracy,memory_F1,memory_recall,memory_precision,motor_accuracy,motor_F1,motor_recall,motor_precision
+0.25,0.1,0.25,0.0625,1.0,1.0,1.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
