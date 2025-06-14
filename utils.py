@@ -2,7 +2,7 @@
 file: utils.py
 
 Utility functions for loading and processing EEG data from h5py files.
-Last updated: 19/05/2025
+Last updated: 14/06/2025
 """
 
 # Import necessary libraries
@@ -12,30 +12,15 @@ import os
 import re
 import pandas as pd
 import numpy as np
-from scipy.io import loadmat
-from IPython.display import display
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast  # Add these imports for mixed precision training
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score, roc_curve, auc, accuracy_score, f1_score, recall_score, precision_score
 import sklearn.preprocessing
 from tqdm.auto import tqdm
-import seaborn
 from enum import Enum
-import shutil
-import subprocess
-import zipfile
-import random
 import optuna
-import json
 from Model import MultiviewDataset, MultiviewAttention
-from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.model_selection import StratifiedKFold
 import matplotlib.pyplot as plt
 from sklearn.model_selection import GroupKFold
@@ -43,18 +28,19 @@ from scipy.signal import butter, filtfilt
 
 # Gloval variables
 debug_mode = False  # controls whether to print debug information
-TASKS = ["resting", "math", "memory", "motor"]
-METRICS = ["accuracy", "F1", "recall", "precision"]
-# selced model to train
-ModelClass = MultiviewAttention
+TASKS = ["resting", "math", "memory", "motor"] # tasks to train on
+METRICS = ["accuracy", "F1", "recall", "precision"] # metrics to evaluate
+ModelClass = MultiviewAttention # selced model to train
 
 # functions
 def get_dataset_from_h5py(filename_path):
     """
-        Get the dataset from the h5py file.
-        Parameters:
+    Get the dataset from the h5py file.
+
+    Parameters:
         filename_path (str): The path to the h5py file.
-        Returns:
+
+    Returns:
         matrix (numpy.ndarray): The dataset as a numpy array.
     """
 
@@ -84,11 +70,13 @@ def get_dataset_from_h5py(filename_path):
 def lowpass_filter(data, cutoff=40, fs=250, order=4):
     """
     Apply a low-pass Butterworth filter to the last dimension (time) of the data.
-    Args:
+    
+    Parameters:
         data: torch.Tensor or np.ndarray, shape (..., T)
         cutoff: cutoff frequency in Hz
         fs: sampling frequency in Hz
         order: filter order
+    
     Returns:
         Filtered data, same shape as input
     """
@@ -99,6 +87,21 @@ def lowpass_filter(data, cutoff=40, fs=250, order=4):
     return torch.tensor(filtered, dtype=torch.float32) if isinstance(data, torch.Tensor) else filtered
 
 def load_dataset(which_dataset="intra", data_dir="./Data", scaler_type="Z_SCORE_LOCAL", downsample_rate=0):
+    """
+    Load the MEG dataset based on the specified type (intra or cross).
+    Parameters:
+        which_dataset (str): "intra" for intra-subject, "cross" for cross-subject.
+        data_dir (str): Directory where the dataset is stored.
+        scaler_type (str): Type of scaling to apply. Options are "MINMAX_LOCAL", "Z_SCORE_LOCAL", "Z_SCORE_TIMEWISE".
+        downsample_rate (int): Factor by which to downsample the data. 0 means no downsampling.
+    Returns:
+        train_data (torch.Tensor): Scaled training data.
+        train_df (pd.DataFrame): Metadata for training data.
+        test_data (torch.Tensor): Scaled test data.
+        test_df (pd.DataFrame): Metadata for test data.
+    """
+
+
     ## load the chosen dataset/s
     train_data, train_df = None, None
     test_data, test_df = None, None
@@ -155,7 +158,16 @@ def load_dataset(which_dataset="intra", data_dir="./Data", scaler_type="Z_SCORE_
     return train_data, train_df, test_data, test_df
 
 def load_eeg_data_and_metadata(folder_path, split):
-    import glob
+    """
+    load EEG data and metadata from a folder containing h5 files.
+
+    Parameters:
+        folder_path (str): Path to the folder containing h5 files.
+        split (str): Split type, e.g., "train" or "test".
+    Returns:
+        data (torch.Tensor): Loaded EEG data as a tensor of shape (N, C, T).
+        df (pd.DataFrame): DataFrame containing metadata for the loaded data.
+    """
     data = []
     meta = []
     file_paths = sorted(glob.glob(os.path.join(folder_path, "*.h5")))
@@ -194,9 +206,11 @@ def load_eeg_data_and_metadata(folder_path, split):
 def downsample(data, factor):
     """
     Downsample the input data by a given factor using average pooling.
-    Args:
+
+    Parameters:
         data (torch.Tensor): Input data of shape (N, C, T).
         factor (int): Downsampling factor.
+    
     Returns:
         torch.Tensor: Downsampled data of shape (N, C, T/factor).
     """
@@ -205,12 +219,23 @@ def downsample(data, factor):
 
     return pool(data)
 
+### Normalization types
 class NormalizationType(Enum):
-    MINMAX_LOCAL = 1
-    Z_SCORE_LOCAL = 2
-    Z_SCORE_TIMEWISE = 3
+    MINMAX_LOCAL = 1 # Normalize each sample independently to [0, 1]
+    Z_SCORE_LOCAL = 2 # Normalize each sample independently
+    Z_SCORE_TIMEWISE = 3 # Normalize each channel across time
 
 def scale_data(data, scaler_type):
+    """
+    Scale the input data based on the specified normalization type.
+    
+    Parameters:
+        data (torch.Tensor or np.ndarray): Input data of shape (N, C, T).
+        scaler_type (NormalizationType): Type of normalization to apply.
+    Returns:
+        torch.Tensor: Scaled data of the same shape as input.
+    """
+
     # data: torch.Tensor of shape (N, C, T)
     data_np = data.numpy() if isinstance(data, torch.Tensor) else data
     if scaler_type == NormalizationType.MINMAX_LOCAL:
@@ -234,6 +259,16 @@ def scale_data(data, scaler_type):
         raise ValueError("Unknown scaler_type")
 
 def save_tensor_and_df(tensor, df, prefix, scaler_type):
+    """ 
+    Save the scaled tensor and metadata DataFrame to disk.
+    
+    Parameters:
+        tensor (torch.Tensor): Scaled data tensor.
+        df (pd.DataFrame): Metadata DataFrame.
+        prefix (str): Prefix for the saved files.
+        scaler_type (NormalizationType): Type of normalization used.    
+    """
+
     # Save to Data/Normalized/scaler_type/
     scaler_str = scaler_type.name.lower()
     out_folder = os.path.join("Data", "Normalized", scaler_str)
@@ -242,6 +277,16 @@ def save_tensor_and_df(tensor, df, prefix, scaler_type):
     df.to_csv(os.path.join(out_folder, f"{prefix}_meta.csv"), index=False)
 
 def load_tensor_and_df(prefix, scaler_type):
+    """
+    Load the scaled tensor and metadata DataFrame from disk.
+
+    Parameters:
+        prefix (str): Prefix for the saved files.
+        scaler_type (NormalizationType): Type of normalization used.
+    
+    Returns:
+        tuple: (tensor, df) where tensor is the scaled data and df is the metadata DataFrame.
+    """
     scaler_str = scaler_type.name.lower()
     out_folder = os.path.join("Data", "Normalized", scaler_str)
     tensor = torch.load(os.path.join(out_folder, f"{prefix}_scaled.pt"), weights_only=False)
@@ -249,6 +294,19 @@ def load_tensor_and_df(prefix, scaler_type):
     return tensor, df
 
 def scale_and_cache(data, df, prefix, scaler_type, downsample_factor):
+    """
+    Scale the data and cache the results to disk.
+
+    Parameters:
+        data (torch.Tensor or np.ndarray): Input data of shape (N, C, T).
+        df (pd.DataFrame): Metadata DataFrame.
+        prefix (str): Prefix for the saved files.
+        scaler_type (NormalizationType): Type of normalization to apply.
+        downsample_factor (int): Factor by which to downsample the data. 0 means no downsampling.
+
+    Returns:
+        tuple: (scaled_data, df) where scaled_data is the scaled tensor and df is the updated metadata DataFrame.
+    """
     scaler_str = scaler_type.name.lower()
     out_folder = os.path.join("Data", "Normalized", scaler_str)
     tensor_path = os.path.join(out_folder, f"{prefix}_scaled.pt")
@@ -272,6 +330,18 @@ def scale_and_cache(data, df, prefix, scaler_type, downsample_factor):
     return scaled, df
 
 def try_load_scaled(prefix, scaler_type):
+    """
+    Try to load the scaled tensor and metadata DataFrame from disk.
+    If they do not exist, return None for both.
+    Parameters:
+        prefix (str): Prefix for the saved files.
+        scaler_type (NormalizationType): Type of normalization used.
+
+     Returns:
+        tuple: (tensor, df) where tensor is the scaled data and df is the metadata DataFrame.
+        If files do not exist, returns (None, None).      
+    """
+
     scaler_str = scaler_type.name.lower()
     out_folder = os.path.join("Data", "Normalized", scaler_str)
     tensor_path = os.path.join(out_folder, f"{prefix}_scaled.pt")
@@ -284,7 +354,7 @@ def try_load_scaled(prefix, scaler_type):
 def extract_sliding_windows(data_tensor, window_size=256, stride=128):
     """
     Efficiently extract sliding windows from EEG data using PyTorch's unfold.
-    Args:
+    Parameters:
         data_tensor: (N, C, T) torch.Tensor
         window_size: int, length of each window
         stride: int, stride between windows
@@ -309,6 +379,20 @@ def get_dataloader(
 ):
     """
     Create a DataLoader for EEG/MEG data, with optional sliding windows.
+
+    Parameters:
+        data_tensor (torch.Tensor): EEG/MEG data tensor of shape (N, C, T).
+        df (pd.DataFrame): DataFrame containing metadata and labels.
+        batch_size (int): Batch size for the DataLoader.
+        input_time_length (int): Length of each input time window.
+        stride (int): Stride for sliding windows.
+        shuffle (bool): Whether to shuffle the data.
+        use_windows (bool): Whether to use sliding windows or not.
+    
+    Returns:
+        DataLoader: PyTorch DataLoader for the EEG/MEG data.
+        X (torch.Tensor): Processed data tensor.
+        y (torch.Tensor): Labels tensor.
     """
     if use_windows:
         X, sample_indices = extract_sliding_windows(data_tensor, window_size=input_time_length, stride=stride)
@@ -324,6 +408,22 @@ def get_dataloader(
 
 
 def get_dataloaders(data_tensor, df, fold_index=None, n_splits=4, batch_size=64):
+    """
+    Create train and validation DataLoaders for EEG/MEG data.
+    Uses StratifiedKFold to ensure balanced class distribution in each fold.
+
+    Parameters:
+        data_tensor (torch.Tensor): EEG/MEG data tensor of shape (N, C, T).
+        df (pd.DataFrame): DataFrame containing metadata and labels.
+        fold_index (int): Index of the fold to use for validation.
+        n_splits (int): Number of splits for cross-validation.
+        batch_size (int): Batch size for the DataLoader.
+    Returns:
+        train_loader (DataLoader): DataLoader for training data.
+        val_loader (DataLoader): DataLoader for validation data.
+        train_df (pd.DataFrame): DataFrame for training metadata.
+        val_df (pd.DataFrame): DataFrame for validation metadata.
+    """
     labels = df["task_type_cat"].values  # or whichever target you use
 
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
@@ -351,7 +451,6 @@ def create_metrics_df():
 
     # --- Dynamically get all possible hyperparameters from the search space ---
     # Use a dummy trial and dummy train_data to extract all keys
-    import optuna
     class DummyTrial:
         def suggest_categorical(self, name, choices): return choices[0]
         def suggest_int(self, name, low, high, step=1): return low
@@ -405,17 +504,17 @@ def create_metrics_df():
     return all_metrics_df
 
 
-def get_mesh_candidates(split_size):
-    mesh_row_candidates = [r for r in range(5, min(50, split_size + 1)) if split_size % r == 0]
-    mesh_row_candidates.sort(key=lambda r: abs(r - (split_size / r)))
+# def get_mesh_candidates(split_size):
+#     mesh_row_candidates = [r for r in range(5, min(50, split_size + 1)) if split_size % r == 0]
+#     mesh_row_candidates.sort(key=lambda r: abs(r - (split_size / r)))
 
-    return mesh_row_candidates
+#     return mesh_row_candidates
 
-def get_mesh_candidate(split_size, mesh_rows_index=None):
-    mesh_row_candidates = get_mesh_candidates(split_size)
+# def get_mesh_candidate(split_size, mesh_rows_index=None):
+#     mesh_row_candidates = get_mesh_candidates(split_size)
 
-    valid_index = mesh_rows_index is not None and mesh_rows_index > -1 and mesh_rows_index < len(mesh_row_candidates)
-    return mesh_row_candidates[mesh_rows_index] if valid_index else mesh_row_candidates[0]
+#     valid_index = mesh_rows_index is not None and mesh_rows_index > -1 and mesh_rows_index < len(mesh_row_candidates)
+#     return mesh_row_candidates[mesh_rows_index] if valid_index else mesh_row_candidates[0]
 
 
 def train_full_model(
@@ -433,7 +532,7 @@ def train_full_model(
     Trains the best model found by Optuna on the full training set and plots training curves.
     Adds early stopping based on training loss.
 
-    Args:
+    Parameters:
         study: Optuna study object after optimization.
         train_data: Training data (numpy array or tensor).
         train_df: Training DataFrame with labels.
@@ -580,6 +679,23 @@ def train_full_model(
     return best_model, best_params, (fig, (ax1, ax2)), train_accs, train_f1s, train_losses
 
 def single_train_epoch(model, train_loader, optimizer, criterion, device):
+    """
+    
+    Train the model for one epoch on the training data.
+    
+    
+    Parameters:
+        model: The model to train.
+        train_loader: DataLoader for the training data.
+        optimizer: Optimizer for the model.
+        criterion: Loss function.
+        device: Torch device (CPU or GPU).
+    Returns:
+        train_preds (np.ndarray): Predictions on the training data.
+        train_targets (np.ndarray): True labels for the training data.
+        train_loss (float): Average loss over the epoch.
+    """
+
     model.train()
     train_preds, train_targets = [], []
     train_loss = 0.0
@@ -592,13 +708,6 @@ def single_train_epoch(model, train_loader, optimizer, criterion, device):
             y_batch = y_batch.to(device)
             optimizer.zero_grad()
             outputs = model(x_cnn_list, x_lstm_list)
-        # elif isinstance(model, MultiviewAttentionOriginal):
-        #     # expects only x_cnn_list
-        #     x_cnn_list, x_lstm_list, y_batch = batch
-        #     x_cnn_list = [x.to(device) for x in x_cnn_list]
-        #     y_batch = y_batch.to(device)
-        #     optimizer.zero_grad()
-        #     outputs = model(x_cnn_list)
         else:
             x_batch, y_batch = batch
             x_batch = x_batch.to(device)
@@ -620,6 +729,17 @@ def single_train_epoch(model, train_loader, optimizer, criterion, device):
 def single_eval_epoch(model, val_loader, criterion, device):
     """
     Evaluate the model for one epoch on the validation or test data.
+    
+    Parameters:
+        model: The model to evaluate.
+        val_loader: DataLoader for the validation or test data.
+        criterion: Loss function.
+        device: Torch device (CPU or GPU).
+    
+    Returns:
+        val_preds (np.ndarray): Predictions on the validation data.
+        val_targets (np.ndarray): True labels for the validation data.
+        val_loss (float): Average loss over the epoch.
     """
     model.eval()
     val_preds, val_targets = [], []
@@ -633,12 +753,6 @@ def single_eval_epoch(model, val_loader, criterion, device):
                 x_lstm_list = [x.to(device) for x in x_lstm_list]
                 y_batch = y_batch.to(device)
                 outputs = model(x_cnn_list, x_lstm_list)
-            # elif isinstance(model, MultiviewAttentionOriginal):
-            #     # expects only x_cnn_list
-            #     x_cnn_list, x_lstm_list, y_batch = batch
-            #     x_cnn_list = [x.to(device) for x in x_cnn_list]
-            #     y_batch = y_batch.to(device)
-            #     outputs = model(x_cnn_list)
             else:
                 x_batch, y_batch = batch
                 x_batch = x_batch.to(device)
@@ -654,17 +768,47 @@ def single_eval_epoch(model, val_loader, criterion, device):
     return val_preds, val_targets, val_loss
 
 def multiview_collate_fn(batch):
-        # batch: list of (x_cnn_list, x_lstm_list, y)
-        batch_size = len(batch)
-        window_size = len(batch[0][0])
-        # x_cnn: list of [batch, depth, mesh_rows, mesh_columns]
-        x_cnn_list = [torch.stack([sample[0][i] for sample in batch], dim=0) for i in range(window_size)]
-        # x_lstm: list of [batch, split_size, depth]
-        x_lstm_list = [torch.stack([sample[1][i] for sample in batch], dim=0) for i in range(window_size)]
-        y = torch.stack([sample[2] for sample in batch], dim=0)
-        return x_cnn_list, x_lstm_list, y
+    """
+    Custom collate function for multiview data.
+    Converts a batch of multiview data into a format suitable for training.
+
+    Parameters:
+        batch: List of tuples, where each tuple contains:
+
+    Returns:
+        x_cnn_list: List of tensors, each tensor is of shape [batch, depth, mesh_rows, mesh_columns].
+        x_lstm_list: List of tensors, each tensor is of shape [batch, split_size, depth].
+        y: Tensor of shape [batch] containing labels.
+    """
+    # batch: list of (x_cnn_list, x_lstm_list, y)
+    batch_size = len(batch)
+    window_size = len(batch[0][0])
+    # x_cnn: list of [batch, depth, mesh_rows, mesh_columns]
+    x_cnn_list = [torch.stack([sample[0][i] for sample in batch], dim=0) for i in range(window_size)]
+    # x_lstm: list of [batch, split_size, depth]
+    x_lstm_list = [torch.stack([sample[1][i] for sample in batch], dim=0) for i in range(window_size)]
+    y = torch.stack([sample[2] for sample in batch], dim=0)
+    return x_cnn_list, x_lstm_list, y
 
 def get_multiview_dataloader(data_tensor, df, batch_size, window_size, mesh_rows, mesh_columns, depth, shuffle=False, augment=False):
+    """
+    Create a DataLoader for multiview EEG/MEG data.
+    
+    Parameters:
+        data_tensor (torch.Tensor): Multiview EEG/MEG data tensor of shape (N, C, T).
+        df (pd.DataFrame): DataFrame containing metadata and labels.
+        batch_size (int): Batch size for the DataLoader.
+        window_size (int): Size of the sliding window.
+        mesh_rows (int): Number of rows in the mesh.
+        mesh_columns (int): Number of columns in the mesh.
+        depth (int): Depth of the input data.
+        shuffle (bool): Whether to shuffle the data.
+        augment (bool): Whether to apply data augmentation.
+    
+    Returns:
+        DataLoader: PyTorch DataLoader for the multiview EEG/MEG data.
+    """
+    
     y_full = df['task_type_cat'].values
     y = torch.tensor(y_full, dtype=torch.long)
     dataset = MultiviewDataset(data_tensor, y, window_size, mesh_rows, mesh_columns, depth, augment=augment)
@@ -756,6 +900,31 @@ def train_model(
     model, train_loader, val_loader, attempt_index, epochs, lr, patience, device,
     all_metrics_df, hyperparams, task_names, fold_idx, min_delta=1e-4, best_model_path=None
 ):
+    """
+    Train the model for a single attempt and fold, logging metrics to all_metrics_df.
+    Adds early stopping based on validation loss and accuracy. 
+    This function is used in the Optuna study to train the model.
+
+    Parameters:
+        model: The model to train.
+        train_loader: DataLoader for the training data.
+        val_loader: DataLoader for the validation data.
+        attempt_index: Index of the training attempt.
+        epochs: Number of epochs to train.
+        lr: Learning rate for the optimizer.
+        patience: Number of epochs with no improvement to wait before stopping.
+        device: Torch device (CPU or GPU).
+        all_metrics_df: DataFrame to log metrics.
+        hyperparams: Dictionary of hyperparameters used for this training attempt.
+        task_names: List of task names for evaluation metrics.
+        fold_idx: Index of the current fold in cross-validation.
+        min_delta: Minimum change to qualify as an improvement for early stopping.
+        best_model_path: Path to save the best model weights, if provided.
+    Returns:
+        all_metrics_df: Updated DataFrame with logged metrics.
+        model: The trained model with the best weights.
+    """
+
     model.to(device)
 
     optimizer_name = hyperparams.get("optimizer", "adam")
@@ -883,7 +1052,7 @@ def train_model(
 
 # --- Optuna workflow ---
 def compute_conv2d_output_size(H, W, kernel_size, padding, stride=1, dilation=1):
-    # Standard PyTorch Conv2d output size formula
+    ## Standard PyTorch Conv2d output size formula
     out_h = (H + 2*padding - dilation*(kernel_size[0]-1) - 1)//stride + 1
     out_w = (W + 2*padding - dilation*(kernel_size[1]-1) - 1)//stride + 1
     return out_h, out_w
@@ -904,6 +1073,18 @@ def get_all_mesh_combinations(number_channels):
 ALL_MESH_COMBOS = get_all_mesh_combinations(number_channels=248)
 
 def get_hyperparameter_search_space(trial, train_data):
+    """
+    Get the hyperparameter search space for the model.
+    This function defines the hyperparameters to be optimized by Optuna.
+
+    Parameters:
+        trial: Optuna trial object.
+        train_data: Training data tensor (shape: [N, C, T]).
+
+    Returns:
+        hyperparams: Dictionary of hyperparameters for the model.
+    """
+
     if ModelClass in [MultiviewAttention]:
         window_size = trial.suggest_categorical('window_size', [8, 16, 24, 32, 48, 50])
         T = train_data.shape[2]
@@ -985,6 +1166,23 @@ def get_hyperparameter_search_space(trial, train_data):
         return hyperparams
         
 def get_training_parts(model, lr=1e-3, weight_decay=1e-4, label_smoothing=0.1, max_epochs=100, optimizer_name="adam"):
+    """
+    Get the optimizer, scheduler, and loss criterion for training the model.
+    This function is used in the Optuna study to set up the training components.
+
+    Parameters:
+        model: The model to train.
+        lr: Learning rate for the optimizer.
+        weight_decay: Weight decay for the optimizer.
+        label_smoothing: Label smoothing factor for the loss function.
+        max_epochs: Maximum number of epochs for the scheduler.
+        optimizer_name: Name of the optimizer to use ('adam', 'adamw', 'rmsprop').
+    Returns:
+        optimizer: The optimizer for training the model.
+        scheduler: The learning rate scheduler. 
+        criterion: The loss function for training the model.
+    """
+    
     if optimizer_name == "adam":
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     elif optimizer_name == "adamw":
@@ -1012,6 +1210,27 @@ def get_training_parts(model, lr=1e-3, weight_decay=1e-4, label_smoothing=0.1, m
 
 def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, best_model_path=None,
               plot_path=None, property_to_split_on='task_type_cat', model_csv_path=None):
+    
+    """
+    Objective function for Optuna hyperparameter optimization.
+    This function defines the hyperparameters to be optimized and trains the model in the Optuna framework.
+    
+    Parameters:
+        trial: Optuna trial object.
+        all_metrics_df: DataFrame to log metrics.
+        train_data: Training data tensor (shape: [N, C, T]).
+        train_df: DataFrame containing metadata and labels for the training set.
+        device: Torch device (CPU or GPU).
+        n_splits: Number of splits for cross-validation.
+        best_model_path: Path to save the best model weights.
+        plot_path: Path to save the performance plot.
+        property_to_split_on: Property to split on for cross-validation (default is 'task_type_cat').
+        model_csv_path: Path to save the metrics DataFrame after each trial.
+    Returns:
+        avg_val_acc: Average validation accuracy across folds.
+        avg_val_loss: Average validation loss across folds.
+        all_metrics_df: Updated DataFrame with logged metrics.
+    """
     try:
         # Define hyperparameters using trial
         hyperparams = get_hyperparameter_search_space(trial, train_data)
@@ -1130,6 +1349,22 @@ def objective(trial, all_metrics_df, train_data, train_df, device, n_splits=4, b
 
 
 def evaluate_model_on_testset(model, test_data, test_df, device, batch_size=64, input_time_length=256, stride=128, path=None):
+    """
+    Evaluate the model on the test set and return metrics and predictions.
+    
+    Parameters:
+        model: The trained model to evaluate.
+        test_data: Test data tensor (shape: [N, C, T]).
+        test_df: DataFrame containing metadata and labels for the test set.
+        device: Torch device (CPU or GPU).
+        batch_size: Batch size for the DataLoader.
+        input_time_length: Length of the input time series.
+        stride: Stride for the sliding window.
+    
+    Returns:
+        test_metrics: Dictionary of evaluation metrics on the test set.
+        df_test_result: DataFrame containing true and predicted labels for the test set.
+    """
     model.eval()
     if isinstance(model, (MultiviewAttention)):
         test_loader = get_multiview_dataloader(
@@ -1173,7 +1408,7 @@ def plot_per_patient_accuracy_bars(
     """
     Plots and saves per-patient and overall accuracy per task as grouped bar plots.
 
-    Args:
+    Parameters:
         df_test_result (pd.DataFrame): DataFrame with columns 'y_true', 'y_pred', 'patient_id'.
         output_dir (str): Output directory for saving the plot.
         which_dataset (str): Dataset name for path.
@@ -1181,6 +1416,9 @@ def plot_per_patient_accuracy_bars(
         timestamp (str): Timestamp for path.
         task_names (list, optional): List of task names. If None, will use sorted unique values from df_test_result.
         style (str): Matplotlib style to use.
+
+    Returns:
+        fig, axs: Figure and axes objects of the plot.
     """
     plt.style.use(style)
 
@@ -1262,6 +1500,9 @@ def plot_per_patient_accuracy_heatmap(
         timestamp (str): Timestamp for path.
         task_names (list, optional): List of task names. If None, will use sorted unique values from df_test_result.
         title (str): Plot title.
+    
+    Returns:
+        fig, ax: Figure and axes objects of the plot.
     """
     plt.style.use('default')
 
@@ -1338,6 +1579,21 @@ def evaluate_and_log_testset(
 ):
     """
     Evaluates the best model on the test set, updates metrics DataFrame, and saves results.
+
+    Parameters:
+        study: Optuna study object containing the best trial.
+        best_model: The best model from the study.
+        best_params: Dictionary of best hyperparameters from the study.
+        test_data: Test data tensor (shape: [N, C, T]).
+        test_df: DataFrame containing metadata and labels for the test set.
+        device: Torch device (CPU or GPU).
+        all_metrics_df: DataFrame to log metrics.
+        model_csv_path: Path to save the metrics DataFrame after evaluation.
+        output_dir: Directory to save results.
+        which_dataset: Name of the dataset for path.
+        model_name: Name of the model for path.
+        timestamp: Timestamp for path.
+        path: Optional path to save test metrics CSV.
 
     Returns:
         test_metrics: dict of test metrics

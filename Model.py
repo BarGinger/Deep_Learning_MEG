@@ -1,10 +1,19 @@
+"""
+file: Model.py
+MultiviewAttention Model for MEG data
+latest update: 14/06/2025
+"""
+
+
 import torch
 import torch.nn as nn
 import numpy as np
-from sklearn.metrics import accuracy_score, f1_score, recall_score, precision_score, confusion_matrix
+from sklearn.metrics import accuracy_score, f1_score, recall_score, precision_score
 import torch.nn.functional as F
-from torchsummary import summary #just for debugging
+from torchsummary import summary
 
+
+## Data augmentation functions
 
 def add_noise(data, noise_level=0.01):
     """Add Gaussian noise to MEG data."""
@@ -45,6 +54,11 @@ def print_model_summary(model, input_shapes, device='cpu'):
         print("Model architecture:\n", model)
 
 
+
+"""
+MultiviewDataset class for handling multiview data with augmentation and time windowing.
+This class prepares the data for a multiview CNN-LSTM model.
+"""
 class MultiviewDataset(torch.utils.data.Dataset):
     def __init__(self, X, y, window_size, mesh_rows, mesh_columns, depth, augment=False, summary_fn='mean'):
         """
@@ -77,9 +91,18 @@ class MultiviewDataset(torch.utils.data.Dataset):
             )
 
     def __len__(self):
+        """
+        Returns the number of samples in the dataset.
+        """
         return self.X.shape[0]
 
     def __getitem__(self, idx):
+        """
+        Returns a single sample from the dataset by given index and applies augmentations if enabled and splits the sample into CNN and LSTM branches.
+        
+        Parameters:
+            idx: Index of the sample to retrieve.
+        """
         x_sample = self.X[idx]  # shape: (number_channels, T)
 
         if self.augment:
@@ -97,6 +120,7 @@ class MultiviewDataset(torch.utils.data.Dataset):
 
         x_cnn_list = []
         x_lstm_list = []
+        # Split the sample into windows
         for i in range(self.window_size):
             start = i * split_size
             end = start + split_size
@@ -122,9 +146,24 @@ class MultiviewDataset(torch.utils.data.Dataset):
             x_lstm_list.append(x_lstm)
 
         return x_cnn_list, x_lstm_list, self.y[idx]
+    
 
+"""
+SelfAttention2D class for 2D self-attention mechanism with relative positional embeddings.
+This class implements a 2D self-attention mechanism with optional relative positional embeddings.
+"""
 class SelfAttention2D(nn.Module):
     def __init__(self, in_channels, dk, dv, n_heads, relative=False):
+        """
+        Parameters:
+        in_channels: int, number of input channels
+        dk: int, dimension of query and key vectors
+        dv: int, dimension of value vectors
+        n_heads: int, number of attention heads
+        relative: bool, whether to use relative positional embeddings
+
+        This class implements a 2D self-attention mechanism with optional relative positional embeddings.
+        """
         super().__init__()
         self.dk = dk
         self.dv = dv
@@ -221,18 +260,43 @@ class SelfAttention2D(nn.Module):
         out = self.output_conv(attn_out)  # (B, dv, H, W)
         return out
 
-
+"""
+AugmentedConv2D class for combining convolution and self-attention in a single layer.
+This class implements a convolutional layer followed by a self-attention mechanism,
+ allowing for both local and global feature extraction.
+"""
 class AugmentedConv2D(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, dk, dv, n_heads, relative):
+        """
+        Parameters:
+            in_channels: int, number of input channels
+            out_channels: int, number of output channels
+            kernel_size: int or tuple, size of the convolution kernel
+            dk: int, dimension of query and key vectors for self-attention
+            dv: int, dimension of value vectors for self-attention
+            n_heads: int, number of attention heads
+            relative: bool, whether to use relative positional embeddings in self-attention
+        """
+
         super().__init__()
         conv_channels = max(out_channels - dv, 1)
         self.conv = nn.Conv2d(in_channels, conv_channels, kernel_size=kernel_size, padding='same')
         self.attn = SelfAttention2D(in_channels, dk, dv, n_heads, relative)
 
     def forward(self, x):
+        """
+        Forward pass through the augmented convolutional layer.
+        
+        """
+        ## Apply convolution and self-attention, then concatenate results along channel dimension
         return torch.cat([self.conv(x), self.attn(x)], dim=1)
 
 
+
+""""
+MultiviewAttention class for the MultiviewAttention model.
+This class implements a multiview attention model that combines CNN and LSTM branches for MEG data classification.
+"""
 class MultiviewAttention(nn.Module):
     def __init__(
         self,
@@ -264,8 +328,47 @@ class MultiviewAttention(nn.Module):
         lstm1_layers=1,
         lstm2_layers=1,
         dropout_rate=0.1,
+        relative=True
     ):
+        """
+        Initialize the MultiviewAttention model with given parameters.
+        
+        Parameters:
+            window_size: int, number of time windows to process
+            conv1_filters: int, number of filters in the first convolutional layer  
+            conv2_filters: int, number of filters in the second convolutional layer
+            conv3_filters: int, number of filters in the third convolutional layer
+            conv1_kernel_shape: int or tuple, kernel size for the first convolutional layer
+            conv2_kernel_shape: int or tuple, kernel size for the second convolutional layer
+            conv3_kernel_shape: int or tuple, kernel size for the third convolutional layer
+            padding1: int or tuple, padding for the first convolutional layer
+            padding2: int or tuple, padding for the second convolutional layer
+            padding3: int or tuple, padding for the third convolutional layer
+            conv1_activation: str, activation function for the first convolutional layer
+            conv2_activation: str, activation function for the second convolutional layer
+            conv3_activation: str, activation function for the third convolutional layer
+            dense_nodes: int, number of nodes in the dense layer after CNN branches
+            dense_activation: str, activation function for the dense layer after CNN branches
+            depth: int, depth of the input data (number of channels)
+            lstm1_cells: int, number of cells in the first LSTM layer
+            lstm2_cells: int, number of cells in the second LSTM layer
+            dense3_nodes: int, number of nodes in the final dense layer
+            dense3_activation: str, activation function for the final dense layer
+            number_channels: int, number of channels in the input data
+            number_of_heads: int, number of attention heads in the self-attention mechanism
+            mesh_rows: int, number of rows in the mesh representation of the data
+            mesh_columns: int, number of columns in the mesh representation of the data
+            number_classes: int, number of output classes for classification
+            lstm1_layers: int, number of layers in the first LSTM (default: 1)
+            lstm2_layers: int, number of layers in the second LSTM (default: 1)
+            dropout_rate: float, dropout rate for regularization (default: 0.1)    
+            relative: bool, whether to use relative positional embeddings in self-attention (default: True)    
+
+        """
+
+
         super().__init__()
+        # Store parameters
         self.window_size = window_size
         self.depth = depth
         self.channels = number_channels
@@ -274,7 +377,10 @@ class MultiviewAttention(nn.Module):
         self.number_classes = number_classes
         self.lstm1_layers = lstm1_layers
         self.lstm2_layers = lstm2_layers
+        self.relative = relative
 
+        # Possible activation functions
+        # Use a dictionary to map activation names to functions
         activations = {
             'relu': nn.ReLU(),
             'elu': nn.ELU(),
@@ -282,6 +388,7 @@ class MultiviewAttention(nn.Module):
             'leakyrelu': nn.LeakyReLU(),
             'tanh': nn.Tanh()
         }
+        # Initialize activation functions based on input parameters, defaulting to ReLU if not found
         self.act1 = activations.get(conv1_activation.lower(), nn.ReLU())
         self.act2 = activations.get(conv2_activation.lower(), nn.ReLU())
         self.act3 = activations.get(conv3_activation.lower(), nn.ReLU())
@@ -289,7 +396,8 @@ class MultiviewAttention(nn.Module):
         self.act_dense3 = activations.get(dense3_activation.lower(), nn.ReLU())
         self.dropout_rate = dropout_rate
 
-        dk = max(4, number_of_heads * 2)  # or another multiple, but must be divisible by number_of_heads
+        # define a valid dimension for dk and dv
+        dk = max(4, number_of_heads * 2)  # must be divisible by number_of_heads
         dv = max(4, number_of_heads * 2)  # same logic
 
         # CNN branches
@@ -297,7 +405,7 @@ class MultiviewAttention(nn.Module):
         self.cnn_dense = nn.ModuleList()
         for _ in range(window_size):
             branch = nn.Sequential(
-                AugmentedConv2D(depth, conv1_filters, conv1_kernel_shape, dk=dk, dv=dv, n_heads=number_of_heads, relative=True),
+                AugmentedConv2D(depth, conv1_filters, conv1_kernel_shape, dk=dk, dv=dv, n_heads=number_of_heads, relative=relative),
                 nn.BatchNorm2d(conv1_filters),
                 self.act1,
                 nn.Dropout(dropout_rate),  # Add dropout here
@@ -344,6 +452,17 @@ class MultiviewAttention(nn.Module):
         self.tasks = ["resting", "math", "memory", "motor"]
 
     def forward(self, x_cnn_list, x_lstm_list):
+        """
+        Forward pass through the MultiviewAttention model.
+        
+        Parameters:
+            x_cnn_list: list of tensors, each tensor has shape [batch, depth, mesh_rows, mesh_columns]  
+            x_lstm_list: list of tensors, each tensor has shape [batch, number_channels, depth]
+
+        Returns:
+            out: tensor, output of the model with shape [batch, number_classes]
+        """
+
         # x_cnn_list: list of [batch, depth, mesh_rows, mesh_columns]
         # x_lstm_list: list of [batch, number_channels, depth]
         cnn_outputs = []
@@ -374,8 +493,19 @@ class MultiviewAttention(nn.Module):
         return self.classifier(out)
 
     def predict(self, loader, device):
+        """
+        Predict class labels for the given data loader.
+        
+        Parameters:
+            loader: DataLoader, data loader containing the input data
+            device: str, device to run the model on ('cpu' or 'cuda')   
+            
+        """
+        # Ensure the model is in evaluation mode
         self.eval()
         preds = []
+
+        # Iterate over the data loader
         with torch.no_grad():
             for batch in loader:
                 batch_x_cnn, batch_x_lstm, _ = batch
@@ -384,21 +514,41 @@ class MultiviewAttention(nn.Module):
                 outputs = self.forward(batch_x_cnn, batch_x_lstm)
                 batch_preds = torch.argmax(outputs, dim=1).cpu().numpy()
                 preds.extend(batch_preds)
+        # Convert predictions to numpy array and return them        
         return np.array(preds)
 
     def evaluate(self, y_pred, y_true):
+        """
+        Evaluate the model's predictions against the true labels.
+
+        Parameters:
+            y_pred: numpy array or torch.Tensor, predicted labels
+            y_true: numpy array or torch.Tensor, true labels
+
+        Returns:
+                results: dict, evaluation metrics including accuracy, F1 score, recall, and precision
+        """
+        # Ensure y_true and y_pred are numpy arrays
         if isinstance(y_true, torch.Tensor):
             y_true = y_true.cpu().numpy()
         if isinstance(y_pred, torch.Tensor):
             y_pred = y_pred.cpu().numpy()
+
+        # initialize results dictionary
         results = {}
+
+        # Calculate overall metrics
         results["overall_accuracy"] = accuracy_score(y_true, y_pred)
         results["overall_F1"] = f1_score(y_true, y_pred, average='macro', zero_division=0)
         results["overall_recall"] = recall_score(y_true, y_pred, average='macro', zero_division=0)
         results["overall_precision"] = precision_score(y_true, y_pred, average='macro', zero_division=0)
+
+        # If tasks are defined, calculate metrics for each task
         if hasattr(self, "tasks") and self.tasks is not None and len(self.tasks) > 1:
             for idx, task in enumerate(self.tasks):
                 mask = (y_true == idx)
+
+                # If no samples for this task, set metrics to NaN
                 if np.sum(mask) == 0:
                     results[f"{task}_accuracy"] = np.nan
                     results[f"{task}_F1"] = np.nan
